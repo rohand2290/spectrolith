@@ -1,1 +1,14 @@
 design_doc.md
+
+# Zig
+.zig-cache/
+zig-cache/
+zig-out/
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
