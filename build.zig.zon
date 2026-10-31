@@ -1,0 +1,7 @@
+.{
+    .name = .spectrolith,
+    .version = "0.1.0",
+    .fingerprint = 0xc9fd36d775ddc767,
+    .minimum_zig_version = "0.17.0",
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
