@@ -16,6 +16,10 @@ const sp = @import("spectrolith");
 
 const base_dst: u64 = 1_000_000;
 
+/// Tiny MemGraph limit so the child flushes a segment every ~10 batches and
+/// kills land inside flushes (segment write, rename, log swap) too.
+const memgraph_limit: usize = 1500;
+
 /// Op list of batch `i`. Deterministic, so the parent can rebuild any prefix.
 fn batchOps(gpa: std.mem.Allocator, b: *sp.Batch, i: u64) !void {
     b.clear();
@@ -36,7 +40,7 @@ fn childMain(gpa: std.mem.Allocator, dir: []const u8, ack_fd: c_int) noreturn {
 }
 
 fn run(gpa: std.mem.Allocator, dir: []const u8, ack_fd: c_int) !void {
-    const db = try sp.Db.open(gpa, .{ .path = dir });
+    const db = try sp.Db.open(gpa, .{ .path = dir, .memgraph_limit_bytes = memgraph_limit });
     var b: sp.Batch = .{};
     var i: u64 = 0;
     while (i < 1_000_000) : (i += 1) {
@@ -96,13 +100,24 @@ fn verify(gpa: std.mem.Allocator, db: *sp.Db, n_batches: u64) !void {
 }
 
 fn removeDir(gpa: std.mem.Allocator, dir: []const u8) void {
-    for ([_][]const u8{ "LOCK", "wal-000001.log" }) |name| {
-        const p = std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ dir, name }, 0) catch continue;
-        defer gpa.free(p);
-        _ = c.unlink(p);
-    }
     const d = gpa.dupeSentinel(u8, dir, 0) catch return;
     defer gpa.free(d);
+    if (c.opendir(d)) |dp| {
+        // Collect first: unlinking while iterating is unspecified.
+        var names: std.ArrayList([:0]u8) = .empty;
+        defer {
+            for (names.items) |n| gpa.free(n);
+            names.deinit(gpa);
+        }
+        while (c.readdir(dp)) |ent| {
+            const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.name)), 0);
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            const p = std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ dir, name }, 0) catch continue;
+            names.append(gpa, p) catch gpa.free(p);
+        }
+        _ = c.closedir(dp);
+        for (names.items) |p| _ = c.unlink(p);
+    }
     _ = c.rmdir(d);
 }
 
@@ -184,8 +199,9 @@ pub fn main(init: std.process.Init) !void {
         }.at;
 
         // Recover.
-        const db = sp.Db.open(gpa, .{ .path = dir }) catch |err| return fail(seed, round, "reopen failed: {s}", .{@errorName(err)});
+        const db = sp.Db.open(gpa, .{ .path = dir, .memgraph_limit_bytes = memgraph_limit }) catch |err| return fail(seed, round, "reopen failed: {s}", .{@errorName(err)});
         const last = db.lastSeq();
+        const segs = db.segmentCount();
 
         // last_seq must land exactly on a batch boundary (atomicity).
         var j: u64 = 0;
@@ -201,14 +217,14 @@ pub fn main(init: std.process.Init) !void {
 
         // Recovery is idempotent, and the log accepts writes after it.
         {
-            const db2 = try sp.Db.open(gpa, .{ .path = dir });
+            const db2 = try sp.Db.open(gpa, .{ .path = dir, .memgraph_limit_bytes = memgraph_limit });
             if (db2.lastSeq() != last) return fail(seed, round, "second recovery changed last_seq", .{});
             var b: sp.Batch = .{};
             defer b.deinit(gpa);
             try batchOps(gpa, &b, j);
             try db2.write(&b);
             db2.close();
-            const db3 = try sp.Db.open(gpa, .{ .path = dir });
+            const db3 = try sp.Db.open(gpa, .{ .path = dir, .memgraph_limit_bytes = memgraph_limit });
             defer db3.close();
             if (db3.lastSeq() != last + seqsInBatch(j)) return fail(seed, round, "write after recovery was lost", .{});
             verify(gpa, db3, j + 1) catch |err| return fail(seed, round, "content mismatch after write-after-recovery: {s}", .{@errorName(err)});
@@ -216,8 +232,8 @@ pub fn main(init: std.process.Init) !void {
 
         total_acked += acked;
         total_recovered += j;
-        std.debug.print("round {d:>3}: killed after {d:>6} us, acked {d:>5}, recovered {d:>5}{s}\n", .{
-            round, delay_us, acked, j, if (j > acked) "  (+1 unacked batch survived)" else "",
+        std.debug.print("round {d:>3}: killed after {d:>6} us, acked {d:>5}, recovered {d:>5}, segments {d:>2}{s}\n", .{
+            round, delay_us, acked, j, segs, if (j > acked) "  (+1 unacked batch survived)" else "",
         });
     }
     std.debug.print("PASS: {d} rounds, {d} acknowledged batches, 0 lost (seed {d})\n", .{ rounds, total_acked, seed });

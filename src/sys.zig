@@ -168,3 +168,49 @@ pub const RwLock = struct {
         _ = c.pthread_rwlock_unlock(&rw.l);
     }
 };
+
+pub fn rename(from: [*:0]const u8, to: [*:0]const u8) Error!void {
+    if (c.rename(from, to) != 0) return error.Io;
+}
+
+// Declared here instead of using std.c's versions: the flag types for
+// PROT/MAP differ per OS and per Zig release, the numeric values below do not.
+extern "c" fn mmap(addr: ?*anyopaque, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) ?*anyopaque;
+extern "c" fn munmap(addr: *anyopaque, len: usize) c_int;
+const PROT_READ: c_int = 1;
+const MAP_PRIVATE: c_int = 2;
+
+pub const page_align = std.heap.page_size_min;
+pub const Mapping = []align(page_align) const u8;
+
+/// Map a whole file read-only. `len` must be > 0 and <= the file size.
+pub fn mapFile(f: File, len: usize) Error!Mapping {
+    const p = mmap(null, len, PROT_READ, MAP_PRIVATE, f.fd, 0) orelse return error.Io;
+    if (@intFromPtr(p) == std.math.maxInt(usize)) return error.Io; // MAP_FAILED
+    const ptr: [*]align(page_align) const u8 = @ptrCast(@alignCast(p));
+    return ptr[0..len];
+}
+
+pub fn unmap(m: Mapping) void {
+    _ = munmap(@ptrCast(@constCast(m.ptr)), m.len);
+}
+
+/// Names (not paths) of the entries of `dir`, excluding "." and "..".
+/// Caller frees each name and the list.
+pub fn listDir(gpa: std.mem.Allocator, dir: [*:0]const u8) (Error || std.mem.Allocator.Error)![][]u8 {
+    const d = c.opendir(dir) orelse return error.Io;
+    defer _ = c.closedir(d);
+    var names: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (names.items) |n| gpa.free(n);
+        names.deinit(gpa);
+    }
+    while (c.readdir(d)) |ent| {
+        const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.name)), 0);
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+        const copy = try gpa.dupe(u8, name);
+        errdefer gpa.free(copy);
+        try names.append(gpa, copy);
+    }
+    return names.toOwnedSlice(gpa);
+}

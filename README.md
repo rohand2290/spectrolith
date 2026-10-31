@@ -8,7 +8,7 @@ The storage design follows LSMGraph (SIGMOD 2025): LSM-tree levels for write thr
 
 ## Status
 
-This is a WIP. The full design is written up, but only the first phase is implemented:
+This is a WIP. The full design is written up, but phases 1 and 2 are implemented:
 
 | Part | State |
 | --- | --- |
@@ -18,8 +18,8 @@ This is a WIP. The full design is written up, but only the first phase is implem
 | Snapshots and neighbor scans over the MemGraph | Implemented |
 | WAL replay on open | Implemented |
 | `kill -9` crash test | Implemented |
-| CSR segment files, flush to L0 | Not started |
-| Versions, manifest, recovery of levels | Not started |
+| CSR segment files (writer, validating mmap reader), flush to L0, merged neighbor scans | Implemented |
+| Versions, manifest, recovery of levels (segments are found by directory scan until then) | Not started |
 | Compaction (leveled and tiered) | Not started |
 | Spectral engine (CSR view, Fiedler vector, delta operator) | Not started |
 | Benchmarks against RocksDB | Not started |

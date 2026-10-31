@@ -16,5 +16,6 @@ test {
     _ = @import("sys.zig");
     _ = @import("wal.zig");
     _ = @import("memgraph.zig");
+    _ = @import("segment.zig");
     _ = @import("db_test.zig");
 }

@@ -19,11 +19,15 @@ const TmpDir = struct {
     }
 
     fn deinit(t: *TmpDir) void {
-        for ([_][]const u8{ "LOCK", "wal-000001.log" }) |name| {
-            const f = std.fmt.allocPrintSentinel(testing.allocator, "{s}/{s}", .{ t.path, name }, 0) catch continue;
-            defer testing.allocator.free(f);
-            sys.unlink(f);
-        }
+        if (sys.listDir(testing.allocator, t.path)) |names| {
+            defer testing.allocator.free(names);
+            for (names) |name| {
+                defer testing.allocator.free(name);
+                const f = std.fmt.allocPrintSentinel(testing.allocator, "{s}/{s}", .{ t.path, name }, 0) catch continue;
+                defer testing.allocator.free(f);
+                sys.unlink(f);
+            }
+        } else |_| {}
         sys.rmdir(t.path);
         testing.allocator.free(t.path);
     }
@@ -302,4 +306,306 @@ test "readers scan consistent snapshots while a writer appends" {
     stop.store(true, .release);
     for (threads) |t| t.join();
     try testing.expectEqual(@as(u32, 0), bad.load(.acquire));
+}
+
+// ---- phase 2: segments and flush ----------------------------------------------
+
+fn countFiles(dir: [:0]const u8, suffix: []const u8) !usize {
+    const names = try sys.listDir(testing.allocator, dir);
+    defer {
+        for (names) |n| testing.allocator.free(n);
+        testing.allocator.free(names);
+    }
+    var n: usize = 0;
+    for (names) |name| {
+        if (std.mem.endsWith(u8, name, suffix)) n += 1;
+    }
+    return n;
+}
+
+test "flush writes an L0 segment; reads merge segment and MemGraph; reopen keeps both" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    var got: std.ArrayList(sp.Edge) = .empty;
+    defer got.deinit(testing.allocator);
+    {
+        const db = try Db.open(testing.allocator, .{ .path = tmp.path, .undirected = false });
+        defer db.close();
+        try db.putEdge(1, 2, 1);
+        try db.putEdge(1, 3, 1);
+        try db.flush();
+        try testing.expectEqual(@as(usize, 1), try countFiles(tmp.path, ".seg"));
+        try testing.expectEqual(@as(usize, 1), try countFiles(tmp.path, ".log")); // old log deleted
+        try db.delEdge(1, 2); // tombstone in MemGraph hides the segment's edge
+        try db.putEdge(1, 4, 1);
+        const s = try db.snapshot();
+        defer s.release();
+        try collect(s, 1, &got);
+        try testing.expectEqual(@as(usize, 2), got.items.len);
+        try testing.expectEqual(@as(u64, 3), got.items[0].dst);
+        try testing.expectEqual(@as(u64, 4), got.items[1].dst);
+        try db.flush();
+        try db.flush(); // empty MemGraph: no-op
+        try testing.expectEqual(@as(usize, 2), try countFiles(tmp.path, ".seg"));
+    }
+    const db = try Db.open(testing.allocator, .{ .path = tmp.path, .undirected = false });
+    defer db.close();
+    try testing.expectEqual(@as(u64, 4), db.lastSeq());
+    const s = try db.snapshot();
+    defer s.release();
+    try collect(s, 1, &got);
+    try testing.expectEqual(@as(usize, 2), got.items.len);
+    try db.putEdge(1, 9, 1);
+    try testing.expectEqual(@as(u64, 5), db.lastSeq());
+}
+
+test "a snapshot taken before a flush keeps reading the same graph" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    const db = try Db.open(testing.allocator, .{ .path = tmp.path, .undirected = false });
+    defer db.close();
+    var got: std.ArrayList(sp.Edge) = .empty;
+    defer got.deinit(testing.allocator);
+
+    try db.putEdge(1, 2, 1);
+    const before = try db.snapshot();
+    defer before.release();
+    try db.flush();
+    try db.putEdge(1, 3, 1);
+    try db.flush();
+    try db.delEdge(1, 2);
+    try db.flush();
+    try collect(before, 1, &got);
+    try testing.expectEqual(@as(usize, 1), got.items.len);
+    try testing.expectEqual(@as(u64, 2), got.items[0].dst);
+    const after = try db.snapshot();
+    defer after.release();
+    try collect(after, 1, &got);
+    try testing.expectEqual(@as(usize, 1), got.items.len);
+    try testing.expectEqual(@as(u64, 3), got.items[0].dst);
+}
+
+test "automatic flush at the MemGraph limit" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    const db = try Db.open(testing.allocator, .{
+        .path = tmp.path,
+        .undirected = false,
+        .sync_mode = .none,
+        .memgraph_limit_bytes = 24 * 100,
+    });
+    defer db.close();
+    for (0..1000) |i| try db.putEdge(i % 10, i, 1);
+    const n = try countFiles(tmp.path, ".seg");
+    try testing.expect(n >= 9 and n <= 10);
+    try testing.expectEqual(@as(usize, 1), try countFiles(tmp.path, ".log"));
+}
+
+test "recovery after a crash between writing a segment and deleting its log" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    // Keep a copy of the log as it was before the flush.
+    const log1 = try tmp.walPath();
+    defer testing.allocator.free(log1);
+    var saved: []u8 = undefined;
+    {
+        const db = try Db.open(testing.allocator, .{ .path = tmp.path, .undirected = false });
+        defer db.close();
+        try db.putEdge(1, 2, 1);
+        try db.putEdge(1, 3, 1);
+        {
+            const f = try sys.File.open(log1, .read);
+            defer f.close();
+            saved = try f.readAll(testing.allocator);
+        }
+        try db.flush();
+        try db.putEdge(1, 4, 1);
+    }
+    defer testing.allocator.free(saved);
+    // Resurrect the old log, as if the unlink never happened.
+    {
+        const f = try sys.File.open(log1, .read_write_create);
+        defer f.close();
+        try f.truncate(0);
+        try f.writeAll(saved);
+    }
+    // Also leave a half-written segment behind.
+    {
+        const p = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/000099.seg.tmp", .{tmp.path}, 0);
+        defer testing.allocator.free(p);
+        const f = try sys.File.open(p, .read_write_create);
+        defer f.close();
+        try f.writeAll("junk");
+    }
+    const db = try Db.open(testing.allocator, .{ .path = tmp.path, .undirected = false });
+    defer db.close();
+    try testing.expectEqual(@as(u64, 3), db.lastSeq());
+    try testing.expectEqual(@as(usize, 0), try countFiles(tmp.path, ".tmp"));
+    try testing.expectEqual(@as(usize, 1), try countFiles(tmp.path, ".log")); // stale log removed
+    var got: std.ArrayList(sp.Edge) = .empty;
+    defer got.deinit(testing.allocator);
+    const s = try db.snapshot();
+    defer s.release();
+    try collect(s, 1, &got);
+    try testing.expectEqual(@as(usize, 3), got.items.len); // 2, 3 once each, plus 4
+}
+
+test "open refuses a corrupt segment" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    {
+        const db = try Db.open(testing.allocator, .{ .path = tmp.path });
+        defer db.close();
+        try db.putEdge(1, 2, 1);
+        try db.flush();
+    }
+    const p = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/000002.seg", .{tmp.path}, 0);
+    defer testing.allocator.free(p);
+    {
+        const f = try sys.File.open(p, .read);
+        const bytes = try f.readAll(testing.allocator);
+        f.close();
+        defer testing.allocator.free(bytes);
+        bytes[bytes.len - 20] ^= 1;
+        const w = try sys.File.open(p, .read_write_create);
+        defer w.close();
+        try w.truncate(0);
+        try w.writeAll(bytes);
+    }
+    try testing.expectError(error.Corrupt, Db.open(testing.allocator, .{ .path = tmp.path }));
+}
+
+/// Dense reference model: weight of edge (v, d), NaN when absent.
+const model_v = 300;
+const model_d = 300;
+const Model = struct {
+    w: []f32,
+
+    fn init() !Model {
+        const w = try testing.allocator.alloc(f32, model_v * model_d);
+        @memset(w, std.math.nan(f32));
+        return .{ .w = w };
+    }
+    fn deinit(m: Model) void {
+        testing.allocator.free(m.w);
+    }
+    fn clone(m: Model) !Model {
+        return .{ .w = try testing.allocator.dupe(f32, m.w) };
+    }
+    fn row(m: Model, v: usize) []f32 {
+        return m.w[v * model_d ..][0..model_d];
+    }
+};
+
+fn expectMatches(seed: u64, at_op: usize, label: []const u8, snap: *sp.Snapshot, m: Model) !void {
+    for (0..model_v) |v| {
+        var it = try snap.neighbors(testing.allocator, v);
+        defer it.deinit();
+        const r = m.row(v);
+        var d: usize = 0;
+        while (it.next()) |e| {
+            while (d < e.dst and std.math.isNan(r[d])) d += 1;
+            if (e.dst >= model_d or d != e.dst or r[d] != e.weight) {
+                std.debug.print("MISMATCH seed={d} op={d} {s} vertex={d}: store has dst={d} w={d}, model expects dst={d}\n", .{ seed, at_op, label, v, e.dst, e.weight, d });
+                return error.ModelMismatch;
+            }
+            d += 1;
+        }
+        while (d < model_d) : (d += 1) {
+            if (!std.math.isNan(r[d])) {
+                std.debug.print("MISMATCH seed={d} op={d} {s} vertex={d}: store is missing dst={d}\n", .{ seed, at_op, label, v, d });
+                return error.ModelMismatch;
+            }
+        }
+    }
+}
+
+test "model: 1M random ops, flushes, frozen snapshots and reopens match the reference" {
+    const seed: u64 = 0x5eed_2;
+    const total_ops: usize = 1_000_000;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    const opts: sp.Options = .{
+        .path = tmp.path,
+        .undirected = false,
+        .sync_mode = .none,
+        .memgraph_limit_bytes = 1 << 20, // ~43k records: about 20 flushes
+    };
+    var db = try Db.open(testing.allocator, opts);
+    var open = true;
+    defer if (open) db.close();
+
+    var model = try Model.init();
+    defer model.deinit();
+
+    const Frozen = struct { snap: *sp.Snapshot, model: Model };
+    var frozen: std.ArrayList(Frozen) = .empty;
+    defer {
+        for (frozen.items) |f| {
+            f.snap.release();
+            f.model.deinit();
+        }
+        frozen.deinit(testing.allocator);
+    }
+
+    var b: sp.Batch = .{};
+    defer b.deinit(testing.allocator);
+
+    var done: usize = 0;
+    var next_check: usize = 100_000;
+    var reopens: usize = 0;
+    while (done < total_ops) {
+        // A batch of 1..8 ops, applied to the store and the model together.
+        b.clear();
+        const n = 1 + rnd.uintLessThan(usize, 8);
+        for (0..n) |k| {
+            const v = rnd.uintLessThan(usize, model_v);
+            const d = rnd.uintLessThan(usize, model_d);
+            if (rnd.uintLessThan(u8, 10) < 3) { // 30% deletes
+                try b.del(testing.allocator, v, d);
+                model.row(v)[d] = std.math.nan(f32);
+            } else {
+                const w: f32 = @floatFromInt(done + k + 1);
+                try b.put(testing.allocator, v, d, w);
+                model.row(v)[d] = w;
+            }
+        }
+        try db.write(&b);
+        done += n;
+
+        if (rnd.uintLessThan(u32, 40_000) == 0) try db.flush();
+
+        if (done >= next_check) {
+            next_check += 100_000;
+            const s = try db.snapshot();
+            try expectMatches(seed, done, "fresh", s, model);
+            try frozen.append(testing.allocator, .{ .snap = s, .model = try model.clone() });
+            // Every earlier snapshot must still show the graph it was taken on.
+            for (frozen.items) |f| try expectMatches(seed, done, "frozen", f.snap, f.model);
+
+            if (frozen.items.len % 3 == 0) { // reopen: recover from segments + log
+                for (frozen.items) |f| {
+                    f.snap.release();
+                    f.model.deinit();
+                }
+                frozen.clearRetainingCapacity();
+                db.close();
+                open = false;
+                db = try Db.open(testing.allocator, opts);
+                open = true;
+                reopens += 1;
+                const s2 = try db.snapshot();
+                defer s2.release();
+                try expectMatches(seed, done, "after reopen", s2, model);
+            }
+        }
+    }
+    try testing.expect(reopens >= 2);
+    try testing.expect(try countFiles(tmp.path, ".seg") >= 10);
+    const last = try db.snapshot();
+    defer last.release();
+    try expectMatches(seed, done, "final", last, model);
 }
