@@ -1,14 +1,15 @@
 //! Immutable CSR segment files (`NNNNNN.seg`).
 //!
-//!   [SegHeader 64][VIdx * n_vertices][EdgeRec * n_edges][SegFooter 16]
+//!   [SegHeader 64][VIdx * n_vertices][EdgeRec * n_edges][bloom][SegFooter 16]
 //!
 //! `VIdx.edge_off` is the CSR row pointer and the edge array is the column
 //! array. A file is written once to `NNNNNN.seg.tmp`, fsynced, renamed, and the
 //! directory fsynced, so a `.seg` file is either absent or complete. It is then
 //! read through `mmap` and viewed in place as typed slices.
 //!
-//! The vertex bloom filter in the format is optional; this writer omits it
-//! (`bloom_off == 0`) and the reader rejects segments that have one.
+//! The bloom filter is optional (`bloom_off == 0` when absent) and lets a scan
+//! skip a segment that lacks the vertex without a binary search. It is an array
+//! of u64 words holding `bloom_hashes` bits per vertex id.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const sys = @import("sys.zig");
@@ -18,6 +19,7 @@ const Crc = std.hash.crc.@"CRC-32/ISCSI";
 
 pub const seg_magic: u32 = 0x47535250; // "PRSG" as little-endian bytes
 pub const footer_magic: u32 = 0x47535046; // "FPSG"
+pub const bloom_hashes = 7; // near-optimal for about 10 bits per vertex
 
 pub const SegHeader = extern struct {
     magic: u32 = seg_magic,
@@ -54,6 +56,45 @@ comptime {
     std.debug.assert(@import("builtin").cpu.arch.endian() == .little);
 }
 
+/// Bit positions of `vid`: double hashing over a splitmix64 of the id.
+const BloomProbe = struct {
+    h: u64,
+    step: u64,
+
+    fn init(vid: u64) BloomProbe {
+        var z = vid +% 0x9e3779b97f4a7c15;
+        z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
+        z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
+        z ^= z >> 31;
+        return .{ .h = z & 0xffffffff, .step = (z >> 32) | 1 };
+    }
+
+    fn next(p: *BloomProbe, nbits: u64) u64 {
+        const bit = p.h % nbits;
+        p.h +%= p.step;
+        return bit;
+    }
+};
+
+pub fn bloomAdd(words: []u64, vid: u64) void {
+    const nbits = @as(u64, words.len) * 64;
+    var p = BloomProbe.init(vid);
+    for (0..bloom_hashes) |_| {
+        const bit = p.next(nbits);
+        words[@intCast(bit / 64)] |= @as(u64, 1) << @intCast(bit % 64);
+    }
+}
+
+pub fn bloomMayContain(words: []const u64, vid: u64) bool {
+    const nbits = @as(u64, words.len) * 64;
+    var p = BloomProbe.init(vid);
+    for (0..bloom_hashes) |_| {
+        const bit = p.next(nbits);
+        if (words[@intCast(bit / 64)] & (@as(u64, 1) << @intCast(bit % 64)) == 0) return false;
+    }
+    return true;
+}
+
 pub fn segPath(gpa: Allocator, dir: []const u8, file_no: u64, tmp: bool) Allocator.Error![:0]u8 {
     return gpa.printSentinel("{s}/{d:0>6}.seg{s}", .{ dir, file_no, if (tmp) ".tmp" else "" }, 0);
 }
@@ -84,6 +125,8 @@ pub const Meta = struct {
 pub const SegWriter = struct {
     gpa: Allocator,
     level: u16,
+    /// Bloom filter size; 0 writes no filter.
+    bloom_bits: u32 = 10,
     vidx: std.ArrayList(VIdx) = .empty,
     edges: std.ArrayList(EdgeRec) = .empty,
     min_seq: u64 = std.math.maxInt(u64),
@@ -140,6 +183,16 @@ pub const SegWriter = struct {
             .min_seq = w.min_seq,
             .max_seq = w.max_seq,
         };
+        const vbytes = std.mem.sliceAsBytes(w.vidx.items);
+        const ebytes = std.mem.sliceAsBytes(w.edges.items);
+
+        const n_words = if (w.bloom_bits == 0) 0 else std.mem.alignForward(u64, nv * w.bloom_bits, 64) / 64;
+        const bloom = try w.gpa.alloc(u64, @intCast(n_words));
+        defer w.gpa.free(bloom);
+        @memset(bloom, 0);
+        if (bloom.len > 0) for (w.vidx.items) |v| bloomAdd(bloom, v.vid);
+        const bbytes = std.mem.sliceAsBytes(bloom);
+
         const hdr: SegHeader = .{
             .level = meta.level,
             .n_vertices = meta.n_vertices,
@@ -148,13 +201,12 @@ pub const SegWriter = struct {
             .max_vid = meta.max_vid,
             .min_seq = meta.min_seq,
             .max_seq = meta.max_seq,
+            .bloom_off = if (bloom.len == 0) 0 else @sizeOf(SegHeader) + vbytes.len + ebytes.len,
         };
-        const vbytes = std.mem.sliceAsBytes(w.vidx.items);
-        const ebytes = std.mem.sliceAsBytes(w.edges.items);
         const footer: SegFooter = .{
             .crc_vidx = Crc.hash(vbytes),
             .crc_edges = Crc.hash(ebytes),
-            .crc_bloom = 0,
+            .crc_bloom = if (bloom.len == 0) 0 else Crc.hash(bbytes),
             .magic = footer_magic,
         };
 
@@ -173,6 +225,7 @@ pub const SegWriter = struct {
         try f.writeAll(std.mem.asBytes(&hdr));
         try f.writeAll(vbytes);
         try f.writeAll(ebytes);
+        try f.writeAll(bbytes);
         try f.writeAll(std.mem.asBytes(&footer));
         try f.sync();
         f.close();
@@ -202,6 +255,7 @@ pub const Segment = struct {
     map: sys.Mapping,
     vidx: []const VIdx,
     edges: []const EdgeRec,
+    bloom: []const u64, // empty when the segment has none
 
     /// Map and fully validate `path`: lengths, magics, CRCs, then the
     /// structural invariants of the index. Corrupt input yields
@@ -214,34 +268,7 @@ pub const Segment = struct {
         const map = try sys.mapFile(f, len);
         errdefer sys.unmap(map);
 
-        const hdr = try parseHeader(map);
-        // Overflow-safe: expected = 64 + 24*nv + 24*ne + 16 must equal the file length.
-        const vbytes_n = std.math.mul(u64, hdr.n_vertices, @sizeOf(VIdx)) catch return error.Corrupt;
-        const ebytes_n = std.math.mul(u64, hdr.n_edges, @sizeOf(EdgeRec)) catch return error.Corrupt;
-        var expect: u64 = @sizeOf(SegHeader);
-        expect = std.math.add(u64, expect, vbytes_n) catch return error.Corrupt;
-        expect = std.math.add(u64, expect, ebytes_n) catch return error.Corrupt;
-        expect = std.math.add(u64, expect, @sizeOf(SegFooter)) catch return error.Corrupt;
-        if (expect != len) return error.Corrupt;
-        if (hdr.n_vertices == 0 or hdr.n_edges < hdr.n_vertices) return error.Corrupt;
-
-        const voff = @sizeOf(SegHeader);
-        const eoff = voff + @as(usize, @intCast(vbytes_n));
-        const foff = eoff + @as(usize, @intCast(ebytes_n));
-        const vb = map[voff..eoff];
-        const eb = map[eoff..foff];
-        var footer: SegFooter = undefined;
-        @memcpy(std.mem.asBytes(&footer), map[foff..][0..@sizeOf(SegFooter)]);
-        if (footer.magic != footer_magic) return error.Corrupt;
-        if (footer.crc_bloom != 0) return error.Corrupt; // no bloom region exists
-        if (Crc.hash(vb) != footer.crc_vidx) return error.Corrupt;
-        if (Crc.hash(eb) != footer.crc_edges) return error.Corrupt;
-
-        // 64 and 24 are multiples of 8, so both regions are 8-aligned.
-        const vidx: []const VIdx = @alignCast(std.mem.bytesAsSlice(VIdx, vb));
-        const edges: []const EdgeRec = @alignCast(std.mem.bytesAsSlice(EdgeRec, eb));
-        try validateIndex(hdr, vidx, edges);
-
+        const p = try parse(map);
         const path_copy = try gpa.dupeSentinel(u8, std.mem.span(path), 0);
         errdefer gpa.free(path_copy);
         const s = try gpa.create(Segment);
@@ -249,28 +276,79 @@ pub const Segment = struct {
             .gpa = gpa,
             .path = path_copy,
             .file_no = file_no,
-            .level = hdr.level,
-            .min_vid = hdr.min_vid,
-            .max_vid = hdr.max_vid,
-            .min_seq = hdr.min_seq,
-            .max_seq = hdr.max_seq,
+            .level = p.hdr.level,
+            .min_vid = p.hdr.min_vid,
+            .max_vid = p.hdr.max_vid,
+            .min_seq = p.hdr.min_seq,
+            .max_seq = p.hdr.max_seq,
             .map = map,
-            .vidx = vidx,
-            .edges = edges,
+            .vidx = p.vidx,
+            .edges = p.edges,
+            .bloom = p.bloom,
         };
         return s;
     }
 
-    fn parseHeader(map: sys.Mapping) types.Error!SegHeader {
+    pub const Parsed = struct {
+        hdr: SegHeader,
+        vidx: []const VIdx,
+        edges: []const EdgeRec,
+        bloom: []const u64,
+    };
+
+    /// Validate a whole segment image and view it as typed slices. Works on
+    /// any 8-aligned bytes; nothing is read outside them.
+    pub fn parse(map: []align(8) const u8) types.Error!Parsed {
+        const len = map.len;
+        if (len < @sizeOf(SegHeader) + @sizeOf(SegFooter)) return error.Corrupt;
+        const hdr = try parseHeader(map);
+        // Overflow-safe: 64 + 24*nv + 24*ne, then the bloom, then the footer.
+        const vbytes_n = std.math.mul(u64, hdr.n_vertices, @sizeOf(VIdx)) catch return error.Corrupt;
+        const ebytes_n = std.math.mul(u64, hdr.n_edges, @sizeOf(EdgeRec)) catch return error.Corrupt;
+        var body: u64 = @sizeOf(SegHeader);
+        body = std.math.add(u64, body, vbytes_n) catch return error.Corrupt;
+        body = std.math.add(u64, body, ebytes_n) catch return error.Corrupt;
+        const bloom_end: u64 = len - @sizeOf(SegFooter);
+        if (body > bloom_end) return error.Corrupt;
+        if (hdr.bloom_off == 0) {
+            if (body != bloom_end) return error.Corrupt;
+        } else {
+            if (hdr.bloom_off != body or body == bloom_end) return error.Corrupt;
+            if ((bloom_end - body) % 8 != 0) return error.Corrupt;
+        }
+        if (hdr.n_vertices == 0 or hdr.n_edges < hdr.n_vertices) return error.Corrupt;
+
+        const voff = @sizeOf(SegHeader);
+        const eoff = voff + @as(usize, @intCast(vbytes_n));
+        const boff = eoff + @as(usize, @intCast(ebytes_n));
+        const foff: usize = @intCast(bloom_end);
+        const vb = map[voff..eoff];
+        const eb = map[eoff..boff];
+        const bb = map[boff..foff];
+        var footer: SegFooter = undefined;
+        @memcpy(std.mem.asBytes(&footer), map[foff..][0..@sizeOf(SegFooter)]);
+        if (footer.magic != footer_magic) return error.Corrupt;
+        if (Crc.hash(vb) != footer.crc_vidx) return error.Corrupt;
+        if (Crc.hash(eb) != footer.crc_edges) return error.Corrupt;
+        if (footer.crc_bloom != (if (bb.len == 0) 0 else Crc.hash(bb))) return error.Corrupt;
+
+        // 64 and 24 are multiples of 8, so all three regions are 8-aligned.
+        const vidx: []const VIdx = @alignCast(std.mem.bytesAsSlice(VIdx, vb));
+        const edges: []const EdgeRec = @alignCast(std.mem.bytesAsSlice(EdgeRec, eb));
+        const bloom: []const u64 = @alignCast(std.mem.bytesAsSlice(u64, bb));
+        try validateIndex(hdr, vidx, edges, bloom);
+        return .{ .hdr = hdr, .vidx = vidx, .edges = edges, .bloom = bloom };
+    }
+
+    fn parseHeader(map: []const u8) types.Error!SegHeader {
         var hdr: SegHeader = undefined;
         @memcpy(std.mem.asBytes(&hdr), map[0..@sizeOf(SegHeader)]);
         if (hdr.magic != seg_magic) return error.Corrupt;
         if (hdr.format_version != 1) return error.Corrupt;
-        if (hdr.bloom_off != 0) return error.Corrupt; // not supported yet
         return hdr;
     }
 
-    fn validateIndex(hdr: SegHeader, vidx: []const VIdx, edges: []const EdgeRec) types.Error!void {
+    fn validateIndex(hdr: SegHeader, vidx: []const VIdx, edges: []const EdgeRec, bloom: []const u64) types.Error!void {
         var next_off: u64 = 0;
         var min_seq: u64 = std.math.maxInt(u64);
         var max_seq: u64 = 0;
@@ -285,6 +363,8 @@ pub const Segment = struct {
                 min_seq = @min(min_seq, r.seq);
                 max_seq = @max(max_seq, r.seq);
             }
+            // A false negative would silently hide the vertex.
+            if (bloom.len > 0 and !bloomMayContain(bloom, v.vid)) return error.Corrupt;
             next_off = end;
         }
         if (next_off != edges.len) return error.Corrupt;
@@ -319,6 +399,7 @@ pub const Segment = struct {
     /// The records of `vid` in (dst asc, seq desc) order, or empty.
     pub fn lookup(s: *const Segment, vid: u64) []const EdgeRec {
         if (vid < s.min_vid or vid > s.max_vid) return &.{};
+        if (s.bloom.len > 0 and !bloomMayContain(s.bloom, vid)) return &.{};
         const Ctx = struct {
             vid: u64,
             fn cmp(c: @This(), v: VIdx) std.math.Order {
@@ -395,6 +476,46 @@ test "write, reopen and look up" {
     try testing.expectEqual(@as(usize, 0), seg.lookup(6).len); // gap
     try testing.expectEqual(@as(usize, 0), seg.lookup(0).len); // below range
     try testing.expectEqual(@as(usize, 0), seg.lookup(101).len); // above range
+}
+
+test "the bloom filter has no false negatives and a low false-positive rate" {
+    const dir = try tmpDir();
+    defer cleanup(dir);
+    var w = SegWriter.init(testing.allocator, 0);
+    defer w.deinit();
+    const n = 2000;
+    for (0..n) |i| try w.addVertex(i * 3, &.{rec(1, i + 1, 1, 0)});
+    _ = try w.finish(dir, 1);
+    const path = try segPath(testing.allocator, dir, 1, false);
+    defer testing.allocator.free(path);
+    const seg = try Segment.open(testing.allocator, path, 1);
+    defer seg.unref();
+    try testing.expect(seg.bloom.len > 0);
+
+    var false_pos: usize = 0;
+    for (0..n) |i| {
+        try testing.expectEqual(@as(usize, 1), seg.lookup(i * 3).len);
+        if (bloomMayContain(seg.bloom, i * 3 + 1)) false_pos += 1;
+    }
+    // About 1% is the theory for 10 bits and 7 hashes.
+    try testing.expect(false_pos < n * 3 / 100);
+}
+
+test "a segment without a bloom filter reads the same" {
+    const dir = try tmpDir();
+    defer cleanup(dir);
+    var w = SegWriter.init(testing.allocator, 0);
+    defer w.deinit();
+    w.bloom_bits = 0;
+    try w.addVertex(4, &.{rec(1, 1, 1, 0)});
+    _ = try w.finish(dir, 1);
+    const path = try segPath(testing.allocator, dir, 1, false);
+    defer testing.allocator.free(path);
+    const seg = try Segment.open(testing.allocator, path, 1);
+    defer seg.unref();
+    try testing.expectEqual(@as(usize, 0), seg.bloom.len);
+    try testing.expectEqual(@as(usize, 1), seg.lookup(4).len);
+    try testing.expectEqual(@as(usize, 0), seg.lookup(3).len);
 }
 
 test "no .tmp file is left after finish" {

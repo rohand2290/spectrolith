@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        mode: [Debug, ReleaseSafe]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - run: zig build test -Doptimize=${{ matrix.mode }} --summary all
+      - run: zig build crashtest -Doptimize=${{ matrix.mode }} -- 40 ${{ github.run_id }}
+      - run: zig build crashtest -Doptimize=${{ matrix.mode }} -- 40 ${{ github.run_id }} .zig-cache/crashtest tiered
+
+  tsan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - run: zig build test -Dtsan=true --summary all
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - run: zig build test --fuzz=500K -Doptimize=ReleaseSafe
+
+  numerics:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install numpy scipy
+      - run: zig build -Doptimize=ReleaseSafe
+      - name: Fiedler vector against scipy on a generated graph
+        run: |
+          python3 scripts/make_test_graph.py > graph.tsv
+          ./zig-out/bin/fiedlercheck graph.tsv check-work 5
+          python3 scripts/check_fiedler.py check-work graph.tsv

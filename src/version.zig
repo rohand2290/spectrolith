@@ -26,6 +26,7 @@ const sys = @import("sys.zig");
 const types = @import("types.zig");
 const seg_mod = @import("segment.zig");
 const Segment = seg_mod.Segment;
+const CsrView = @import("spectral.zig").CsrView;
 const Error = types.Error;
 const Crc = std.hash.crc.@"CRC-32/ISCSI";
 
@@ -44,8 +45,19 @@ pub const Version = struct {
     gpa: Allocator,
     refs: std.atomic.Value(u32) = .init(1),
     /// L0: newest first, ranges may overlap. L1 and deeper: sorted by vertex
-    /// range, pairwise disjoint.
+    /// range, pairwise disjoint; under the tiered policy they are like L0.
     levels: [max_levels][]const *Segment = @splat(&.{}),
+    /// Merged CSR of this layout, built on first use and freed with it.
+    view: ?*CsrView = null,
+    view_mu: sys.Mutex = .{},
+
+    /// The CSR view of this Version. The result lives as long as the Version.
+    pub fn csrView(v: *Version) Error!*const CsrView {
+        v.view_mu.lock();
+        defer v.view_mu.unlock();
+        if (v.view == null) v.view = try CsrView.build(v.gpa, v);
+        return v.view.?;
+    }
 
     pub fn ref(v: *Version) *Version {
         _ = v.refs.fetchAdd(1, .monotonic);
@@ -56,6 +68,7 @@ pub const Version = struct {
     /// segment that is obsolete and has no other holder is unlinked then.
     pub fn unref(v: *Version) void {
         if (v.refs.fetchSub(1, .acq_rel) != 1) return;
+        if (v.view) |g| g.destroy();
         for (v.levels) |segs| {
             for (segs) |s| s.unref();
             v.gpa.free(segs);
@@ -225,7 +238,7 @@ fn segLessRange(_: void, a: *Segment, b: *Segment) bool {
 /// Build the Version that results from applying `edit` to `base` (null: an
 /// empty database). Every added entry must carry its segment. The result holds
 /// its own reference on each segment it lists. Nothing here touches the disk.
-fn applyEdit(gpa: Allocator, base: ?*const Version, edit: *const VersionEdit) Error!*Version {
+fn applyEdit(gpa: Allocator, base: ?*const Version, edit: *const VersionEdit, overlapping_levels: bool) Error!*Version {
     const v = try gpa.create(Version);
     v.* = .{ .gpa = gpa };
     errdefer v.unref();
@@ -246,7 +259,7 @@ fn applyEdit(gpa: Allocator, base: ?*const Version, edit: *const VersionEdit) Er
             if (a.level != lvl) continue;
             try list.append(gpa, a.seg.?.ref());
         }
-        if (lvl == 0) {
+        if (lvl == 0 or overlapping_levels) {
             std.mem.sort(*Segment, list.items, {}, segLessL0);
         } else {
             std.mem.sort(*Segment, list.items, {}, segLessRange);
@@ -313,6 +326,8 @@ pub const VersionSet = struct {
     next_file_no: std.atomic.Value(u64),
     /// WALs numbered below this are obsolete. Guarded by `apply_mu`.
     log_number: u64,
+    /// Levels below L0 may overlap (the tiered policy).
+    overlapping_levels: bool,
     manifest: ?sys.File = null,
     manifest_no: u64 = 0,
     manifest_size: u64 = 0,
@@ -344,7 +359,11 @@ pub const VersionSet = struct {
     ///
     /// A directory with segments but no `CURRENT` (written before manifests
     /// existed) is adopted as an all-L0 layout.
-    pub fn recover(gpa: Allocator, dir: [:0]const u8) Error!Recovered {
+    ///
+    /// The policy is not recorded: a store with overlapping deep levels opened
+    /// as leveled is refused with `error.InvalidArgument`. The other way round
+    /// is fine, since disjoint levels are a special case of overlapping ones.
+    pub fn recover(gpa: Allocator, dir: [:0]const u8, overlapping_levels: bool) Error!Recovered {
         var seg_nos: std.ArrayList(u64) = .empty;
         defer seg_nos.deinit(gpa);
         var wal_nos: std.ArrayList(u64) = .empty;
@@ -423,7 +442,16 @@ pub const VersionSet = struct {
             try edit.addSegment(gpa, level, seg);
             if (adopted) last_seq = @max(last_seq, seg.max_seq);
         }
-        const version = try applyEdit(gpa, null, &edit);
+        if (!overlapping_levels) {
+            for (edit.added.items, 0..) |a, i| {
+                if (a.level == 0) continue;
+                for (edit.added.items[i + 1..]) |b| {
+                    if (b.level == a.level and a.seg.?.max_vid >= b.seg.?.min_vid and
+                        b.seg.?.max_vid >= a.seg.?.min_vid) return error.InvalidArgument;
+                }
+            }
+        }
+        const version = try applyEdit(gpa, null, &edit, overlapping_levels);
         errdefer version.unref();
 
         // Garbage: segment files the manifest does not list.
@@ -441,6 +469,7 @@ pub const VersionSet = struct {
                 .current = version,
                 .next_file_no = .init(@max(next_file_no, max_no + 1)),
                 .log_number = log_number,
+                .overlapping_levels = overlapping_levels,
             },
             .last_seq = last_seq,
             .wal_nos = try wal_nos.toOwnedSlice(gpa),
@@ -520,7 +549,7 @@ pub const VersionSet = struct {
 
         edit.next_file_no = vs.next_file_no.load(.monotonic);
         const base = vs.current;
-        const next = try applyEdit(vs.gpa, base, edit);
+        const next = try applyEdit(vs.gpa, base, edit, vs.overlapping_levels);
         errdefer next.unref();
 
         try vs.appendRecord(edit);
@@ -559,7 +588,7 @@ pub const VersionSet = struct {
 /// Replay every record of a manifest into the live set. A torn final record
 /// (the crash interrupted its append) is dropped: it was never acknowledged.
 /// Damage anywhere else is `Corrupt`.
-fn replayManifest(
+pub fn replayManifest(
     gpa: Allocator,
     bytes: []const u8,
     live: *std.AutoHashMapUnmanaged(u64, u16),

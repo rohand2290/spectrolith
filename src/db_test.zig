@@ -414,6 +414,7 @@ test "automatic flush at the MemGraph limit" {
     });
     defer db.close();
     for (0..1000) |i| try db.putEdge(i % 10, i, 1);
+    try db.waitForFlush();
     const n = try countFiles(tmp.path, ".seg");
     try testing.expect(n >= 9 and n <= 10);
     try testing.expectEqual(@as(usize, 1), try countFiles(tmp.path, ".log"));
@@ -546,6 +547,14 @@ test "model: random manual compactions at every level never resurrect a delete" 
     try runModel(0x5eed_3, 600_000, false);
 }
 
+test "model: tiered with background compaction" {
+    try runModelStyle(0x5eed_4, 800_000, true, .tiered);
+}
+
+test "model: tiered, compactions at random points and levels" {
+    try runModelStyle(0x5eed_5, 800_000, false, .tiered);
+}
+
 /// Small levels so data really descends: ~1 MiB flushes, L1 holds 1 MiB, each
 /// level 3x the one above, output segments of 128 KiB (many per level, so the
 /// disjoint-range handling is exercised too).
@@ -565,12 +574,17 @@ fn compactingOptions(path: [:0]const u8, bg: bool) sp.Options {
 }
 
 fn runModel(seed: u64, total_ops: usize, bg: bool) !void {
+    try runModelStyle(seed, total_ops, bg, .leveled);
+}
+
+fn runModelStyle(seed: u64, total_ops: usize, bg: bool, style: sp.CompactionStyle) !void {
     var prng = std.Random.DefaultPrng.init(seed);
     const rnd = prng.random();
 
     var tmp = try TmpDir.init();
     defer tmp.deinit();
-    const opts = compactingOptions(tmp.path, bg);
+    var opts = compactingOptions(tmp.path, bg);
+    opts.compaction_style = style;
     var db = try Db.open(testing.allocator, opts);
     var open = true;
     defer if (open) db.close();
@@ -660,10 +674,13 @@ fn runModel(seed: u64, total_ops: usize, bg: bool) !void {
     // Compaction really ran and really collected garbage.
     const st = db.stats();
     var compactions: u64 = 0;
-    for (st.levels) |l| compactions += l.compactions;
-    try testing.expect(compactions >= 5);
+    for (st.levels[1..]) |l| compactions += l.compactions;
+    // Counters restart at each reopen, and tiered compacts far less often.
+    try testing.expect(compactions >= @as(u64, if (style == .tiered) 1 else 5));
     try testing.expect(st.dropped_records > 0);
-    try testing.expect(st.levels[1].files > 0);
+    var deep: usize = 0;
+    for (st.levels[1..]) |l| deep += l.files;
+    try testing.expect(deep > 0);
     try testing.expect(db.levelFileCounts()[0] < 3 or !bg); // L0 stays bounded
 
     // Release the frozen snapshots: every obsolete file must then be gone, so
@@ -1082,7 +1099,7 @@ test "reads stay consistent while the writer flushes and compaction replaces seg
     try testing.expectEqual(@as(u32, 0), bad.load(.acquire));
     try testing.expect(db.stats().flushes > 20);
     var compactions: u64 = 0;
-    for (db.stats().levels) |l| compactions += l.compactions;
+    for (db.stats().levels[1..]) |l| compactions += l.compactions;
     try testing.expect(compactions > 5);
 }
 
@@ -1111,4 +1128,281 @@ test "an upgraded database from before manifests opens as an all-L0 layout" {
     const s = try db.snapshot();
     defer s.release();
     try testing.expectEqual(@as(usize, 2), try collectDsts(s, 1));
+}
+
+// ---- background flush ---------------------------------------------------------
+
+test "a scan during a flush sees the frozen MemGraph, and snapshots keep it after the flush" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    const db = try Db.open(testing.allocator, .{
+        .path = tmp.path,
+        .undirected = false,
+        .sync_mode = .none,
+        .memgraph_limit_bytes = 24 * 50,
+        .background_compaction = false,
+    });
+    defer db.close();
+
+    // Each snapshot may land before, during or after any flush; every one must
+    // see exactly the edges acknowledged before it, whichever source holds them.
+    var snaps: std.ArrayList(*sp.Snapshot) = .empty;
+    defer {
+        for (snaps.items) |s| s.release();
+        snaps.deinit(testing.allocator);
+    }
+    for (0..2_000) |i| {
+        try db.putEdge(7, i, @floatFromInt(i));
+        if (i % 97 == 0) try snaps.append(testing.allocator, try db.snapshot());
+    }
+    try db.waitForFlush();
+    for (snaps.items, 0..) |s, k| {
+        try testing.expectEqual(k * 97 + 1, try collectDsts(s, 7));
+    }
+}
+
+test "a kill between rotation and install replays both logs in order" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    // Stop the world at the on-disk state a crash mid-flush leaves: two live
+    // logs, and a newer version of an edge in the second.
+    const opts: sp.Options = .{ .path = tmp.path, .undirected = false };
+    var first: []u8 = undefined;
+    const log1 = try tmp.walPath();
+    defer testing.allocator.free(log1);
+    {
+        const db = try Db.open(testing.allocator, opts);
+        defer db.close();
+        try db.putEdge(1, 2, 1.0);
+        try db.putEdge(1, 3, 1.0);
+        const f = try sys.File.open(log1, .read);
+        defer f.close();
+        first = try f.readAll(testing.allocator);
+    }
+    defer testing.allocator.free(first);
+    const log2 = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/wal-000099.log", .{tmp.path}, 0);
+    defer testing.allocator.free(log2);
+    {
+        const wal = @import("wal.zig");
+        const ops = [_]@import("batch.zig").Op{.{ .kind = .put, .src = 1, .dst = 2, .weight = 9.0 }};
+        var w = try wal.Wal.create(testing.allocator, log2, tmp.path);
+        defer w.close();
+        try w.append(3, &ops);
+        try w.sync();
+    }
+    const db = try Db.open(testing.allocator, opts);
+    defer db.close();
+    try testing.expectEqual(@as(u64, 3), db.lastSeq());
+    const s = try db.snapshot();
+    defer s.release();
+    var got: std.ArrayList(sp.Edge) = .empty;
+    defer got.deinit(testing.allocator);
+    try collect(s, 1, &got);
+    try testing.expectEqual(@as(usize, 2), got.items.len);
+    try testing.expectEqual(@as(f32, 9.0), got.items[0].weight);
+
+    // The older log is released by the next flush, and writes keep going.
+    try db.putEdge(1, 4, 1.0);
+    try db.flush();
+    try testing.expectEqual(@as(usize, 1), try countFiles(tmp.path, ".log"));
+}
+
+test "close drains a frozen MemGraph into L0" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    const opts: sp.Options = .{
+        .path = tmp.path,
+        .undirected = false,
+        .sync_mode = .none,
+        .memgraph_limit_bytes = 24 * 100,
+        .background_compaction = false,
+    };
+    {
+        const db = try Db.open(testing.allocator, opts);
+        defer db.close();
+        for (0..101) |i| try db.putEdge(1, i, 1);
+        try db.putEdge(1, 101, 1); // the write that freezes the first 101
+    }
+    try testing.expectEqual(@as(usize, 1), try countFiles(tmp.path, ".seg"));
+    const db = try Db.open(testing.allocator, opts);
+    defer db.close();
+    const s = try db.snapshot();
+    defer s.release();
+    try testing.expectEqual(@as(usize, 102), try collectDsts(s, 1));
+}
+
+// ---- tiered compaction and metrics ---------------------------------------------
+
+fn tieredOpts(path: [:0]const u8) sp.Options {
+    return .{
+        .path = path,
+        .undirected = false,
+        .sync_mode = .none,
+        .background_compaction = false,
+        .compaction_style = .tiered,
+        .l0_compaction_trigger = 2,
+        .size_ratio = 2,
+    };
+}
+
+test "tiered: a delete survives until no older run below can hold the edge" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    const db = try Db.open(testing.allocator, tieredOpts(tmp.path));
+    defer db.close();
+    // An old run of the edge in L1, then a delete that compacts down onto the
+    // same level. Dropping the tombstone there would bring the edge back.
+    try db.putEdge(1, 2, 1);
+    try db.flush();
+    _ = try db.compactLevel(0);
+    try db.delEdge(1, 2);
+    try db.putEdge(1, 3, 1);
+    try db.flush();
+    _ = try db.compactLevel(0);
+    try testing.expectEqual(@as(usize, 2), db.levelFileCounts()[1]);
+    {
+        const s = try db.snapshot();
+        defer s.release();
+        try testing.expectEqual(@as(usize, 1), try collectDsts(s, 1));
+    }
+    // Merged together at the bottom, the tombstone and the old edge both go.
+    _ = try db.compactLevel(1);
+    try testing.expectEqual(@as(usize, 1), db.levelFileCounts()[2]);
+    const s = try db.snapshot();
+    defer s.release();
+    try testing.expectEqual(@as(usize, 1), try collectDsts(s, 1));
+    try testing.expect(db.stats().dropped_records >= 2);
+}
+
+test "tiered: a full level merges into one run, leaving the runs below alone" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    const db = try Db.open(testing.allocator, tieredOpts(tmp.path));
+    defer db.close();
+    for (0..5) |round| {
+        for (0..3) |i| try db.putEdge(round * 10 + i, i, 1);
+        try db.flush();
+        while (try db.compactOnce()) {}
+    }
+    const c = db.levelFileCounts();
+    for (c[0..]) |n| try testing.expect(n <= 2);
+    const s = try db.snapshot();
+    defer s.release();
+    for (0..5) |round| try testing.expectEqual(@as(usize, 1), try collectDsts(s, round * 10));
+}
+
+test "a tiered store reopens, but will not open as leveled" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    {
+        const db = try Db.open(testing.allocator, tieredOpts(tmp.path));
+        defer db.close();
+        for (0..2) |_| {
+            try db.putEdge(1, 2, 1);
+            try db.flush();
+            _ = try db.compactLevel(0);
+        }
+        try testing.expectEqual(@as(usize, 2), db.levelFileCounts()[1]);
+    }
+    {
+        const db = try Db.open(testing.allocator, tieredOpts(tmp.path));
+        defer db.close();
+        try testing.expectEqual(@as(usize, 2), db.levelFileCounts()[1]);
+    }
+    var leveled = tieredOpts(tmp.path);
+    leveled.compaction_style = .leveled;
+    try testing.expectError(error.InvalidArgument, Db.open(testing.allocator, leveled));
+}
+
+test "a leveled store opens as tiered" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    {
+        const db = try Db.open(testing.allocator, manualOpts(tmp.path));
+        defer db.close();
+        for (0..20) |i| try db.putEdge(i, i, 1);
+        try db.flush();
+        _ = try db.compactLevel(0);
+    }
+    const db = try Db.open(testing.allocator, tieredOpts(tmp.path));
+    defer db.close();
+    const s = try db.snapshot();
+    defer s.release();
+    try testing.expectEqual(@as(usize, 1), try collectDsts(s, 7));
+}
+
+test "stats: amplification numbers add up on a known workload" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    const db = try Db.open(testing.allocator, manualOpts(tmp.path));
+    defer db.close();
+    for (0..1000) |i| try db.putEdge(i, i + 1, 1);
+    try db.flush();
+    var st = db.stats();
+    try testing.expectEqual(@as(u64, 24_000), st.ingested_bytes);
+    try testing.expect(st.wal_bytes > 21_000);
+    try testing.expectEqual(st.flush_bytes, st.levels[0].bytes_written);
+    try testing.expect(st.writeAmp() > 1 and st.writeAmp() < 5);
+
+    // Rewrites of the same edges: dead versions take space until compacted.
+    for (0..1000) |i| try db.putEdge(i, i + 1, 2);
+    try db.flush();
+    const before = try db.spaceAmp();
+    _ = try db.compactLevel(0);
+    const after = try db.spaceAmp();
+    try testing.expect(after > 1); // the vertex index and bloom filter are real bytes
+    try testing.expectApproxEqAbs(@as(f64, 2), before / after, 0.01);
+    st = db.stats();
+    try testing.expectEqual(@as(u64, 1), st.levels[1].compactions);
+    try testing.expect(st.levels[1].writeAmp() > 0.3 and st.levels[1].writeAmp() < 0.7);
+}
+
+test "stats: runs merged counts the sources a scan really touches" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    const db = try Db.open(testing.allocator, manualOpts(tmp.path));
+    defer db.close();
+    try db.putEdge(1, 2, 1);
+    try db.flush();
+    try db.putEdge(1, 3, 1);
+    try db.flush();
+    try db.putEdge(1, 4, 1);
+    const s = try db.snapshot();
+    defer s.release();
+    {
+        var it = try s.neighbors(testing.allocator, 1);
+        defer it.deinit();
+        try testing.expectEqual(@as(usize, 3), it.runs); // two segments + MemGraph
+    }
+    {
+        var it = try s.neighbors(testing.allocator, 999); // bloom or range rules all out
+        defer it.deinit();
+        try testing.expectEqual(@as(usize, 0), it.runs);
+    }
+    const st = db.stats();
+    try testing.expectEqual(@as(u64, 2), st.scans);
+    try testing.expectEqual(@as(f64, 1.5), st.readAmp());
+}
+
+test "bloom filters can be switched off and stay compatible on reopen" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    var o = manualOpts(tmp.path);
+    o.bloom_bits_per_vertex = 0;
+    {
+        const db = try Db.open(testing.allocator, o);
+        defer db.close();
+        try db.putEdge(1, 2, 1);
+        try db.flush();
+    }
+    o.bloom_bits_per_vertex = 10;
+    const db = try Db.open(testing.allocator, o);
+    defer db.close();
+    try db.putEdge(1, 3, 1);
+    try db.flush();
+    const s = try db.snapshot();
+    defer s.release();
+    try testing.expectEqual(@as(usize, 2), try collectDsts(s, 1));
+    o.bloom_bits_per_vertex = 65;
+    try testing.expectError(error.InvalidArgument, Db.open(testing.allocator, o));
 }

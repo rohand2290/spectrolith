@@ -57,6 +57,9 @@ pub const CompactionPolicy = struct {
         score: *const fn (ptr: *anyopaque, v: *const Version, level: u16) f64,
         /// The next compaction to run, or null when nothing needs one.
         pick: *const fn (ptr: *anyopaque, gpa: Allocator, v: *const Version) Error!?Compaction,
+        /// Inputs for compacting `level` regardless of its score, or null when
+        /// it holds nothing or has nowhere to go.
+        pickLevel: *const fn (ptr: *anyopaque, gpa: Allocator, v: *const Version, level: u16) Error!?Compaction,
     };
 
     pub fn score(p: CompactionPolicy, v: *const Version, level: u16) f64 {
@@ -65,6 +68,10 @@ pub const CompactionPolicy = struct {
 
     pub fn pick(p: CompactionPolicy, gpa: Allocator, v: *const Version) Error!?Compaction {
         return p.vtable.pick(p.ptr, gpa, v);
+    }
+
+    pub fn pickLevel(p: CompactionPolicy, gpa: Allocator, v: *const Version, level: u16) Error!?Compaction {
+        return p.vtable.pickLevel(p.ptr, gpa, v, level);
     }
 
     /// Highest score over all levels that can be compacted.
@@ -89,7 +96,7 @@ pub const Leveled = struct {
     cursor: [max_levels]?u64 = @splat(null),
 
     pub fn policy(self: *Leveled) CompactionPolicy {
-        return .{ .ptr = self, .vtable = &.{ .score = score, .pick = pick } };
+        return .{ .ptr = self, .vtable = &.{ .score = score, .pick = pick, .pickLevel = pickLevel } };
     }
 
     /// L0 by file count, deeper levels by bytes against their target. The last
@@ -120,13 +127,14 @@ pub const Leveled = struct {
             }
         }
         if (best < 1) return null;
-        return self.pickLevel(gpa, v, best_level);
+        return pickLevel(self, gpa, v, best_level);
     }
 
     /// Inputs for compacting `level` into `level + 1` regardless of score
     /// (manual compaction). L0 takes every segment; deeper levels take one
     /// segment, rotating through the level, plus what it overlaps below.
-    pub fn pickLevel(self: *Leveled, gpa: Allocator, v: *const Version, level: u16) Error!?Compaction {
+    fn pickLevel(ptr: *anyopaque, gpa: Allocator, v: *const Version, level: u16) Error!?Compaction {
+        const self: *Leveled = @ptrCast(@alignCast(ptr));
         if (level + 1 >= max_levels) return null;
         const src = v.levels[level];
         if (src.len == 0) return null;
@@ -160,12 +168,57 @@ pub const Leveled = struct {
     }
 };
 
-/// No segment below `out_level` overlaps [lo, hi]: nothing older than the
-/// compaction's inputs can exist for these vertices.
-pub fn isBottom(v: *const Version, out_level: u16, lo: u64, hi: u64) bool {
-    for (out_level + 1..max_levels) |lvl| {
-        for (v.levels[lvl]) |s| {
-            if (s.max_vid >= lo and s.min_vid <= hi) return false;
+/// Write-optimized policy. Every level holds up to T overlapping sorted runs,
+/// one file each. A full level is merged whole into one new run on the level
+/// below, without touching what is already there, so each record is rewritten
+/// once per level instead of about T times. The price is reads, which may have
+/// to look at every run of every level.
+pub const Tiered = struct {
+    params: LeveledParams,
+
+    pub fn policy(self: *Tiered) CompactionPolicy {
+        return .{ .ptr = self, .vtable = &.{ .score = score, .pick = pick, .pickLevel = pickLevel } };
+    }
+
+    fn score(ptr: *anyopaque, v: *const Version, level: u16) f64 {
+        const self: *Tiered = @ptrCast(@alignCast(ptr));
+        if (level + 1 >= max_levels) return 0;
+        const limit = if (level == 0) self.params.l0_compaction_trigger else self.params.size_ratio;
+        return @as(f64, @floatFromInt(v.levels[level].len)) / @as(f64, @floatFromInt(limit));
+    }
+
+    fn pick(ptr: *anyopaque, gpa: Allocator, v: *const Version) Error!?Compaction {
+        var best_level: u16 = 0;
+        var best: f64 = 0;
+        for (0..max_levels - 1) |lvl| {
+            const s = score(ptr, v, @intCast(lvl));
+            if (s > best) {
+                best = s;
+                best_level = @intCast(lvl);
+            }
+        }
+        if (best < 1) return null;
+        return pickLevel(ptr, gpa, v, best_level);
+    }
+
+    fn pickLevel(_: *anyopaque, gpa: Allocator, v: *const Version, level: u16) Error!?Compaction {
+        if (level + 1 >= max_levels or v.levels[level].len == 0) return null;
+        const in0 = try gpa.dupe(*Segment, v.levels[level]);
+        errdefer gpa.free(in0);
+        return .{ .level = level, .inputs = .{ in0, try gpa.alloc(*Segment, 0) } };
+    }
+};
+
+/// No segment outside the inputs, at the output level or below, overlaps the
+/// compaction's range: nothing older than the inputs can exist for these
+/// vertices. Under the tiered policy the output level itself can hold older
+/// runs, which is why it is checked too.
+pub fn isBottom(v: *const Version, comp: Compaction, lo: u64, hi: u64) bool {
+    for (comp.outLevel()..max_levels) |lvl| {
+        next: for (v.levels[lvl]) |s| {
+            if (s.max_vid < lo or s.min_vid > hi) continue;
+            for (comp.inputs[1]) |input| if (input == s) continue :next;
+            return false;
         }
     }
     return true;
@@ -173,6 +226,8 @@ pub fn isBottom(v: *const Version, out_level: u16, lo: u64, hi: u64) bool {
 
 pub const MergeStats = struct {
     bytes_read: u64 = 0,
+    /// The part of `bytes_read` that came down from the source level.
+    bytes_from_above: u64 = 0,
     bytes_written: u64 = 0,
     records_in: u64 = 0,
     records_out: u64 = 0,
@@ -186,6 +241,7 @@ pub const MergeParams = struct {
     /// Close an output segment, at a vertex boundary, once it holds this many
     /// bytes of records.
     target_bytes: u64,
+    bloom_bits: u32,
 };
 
 /// Decide which records of one vertex survive. `runs` yields the vertex's
@@ -248,6 +304,7 @@ pub fn mergeInputs(
     defer gpa.free(cursors);
     @memset(cursors, 0);
     for (all.items) |s| stats.bytes_read += s.bytes();
+    for (comp.inputs[0]) |s| stats.bytes_from_above += s.bytes();
 
     var heap: merge.RunHeap = .empty;
     defer heap.deinit(gpa);
@@ -255,6 +312,7 @@ pub fn mergeInputs(
     defer kept.deinit(gpa);
     var w = seg_mod.SegWriter.init(gpa, p.out_level);
     defer w.deinit();
+    w.bloom_bits = p.bloom_bits;
 
     while (true) {
         // Next vertex: the smallest vid any input has not yet consumed.

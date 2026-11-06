@@ -6,6 +6,7 @@ const batch_mod = @import("batch.zig");
 pub const Error = types.Error;
 pub const Edge = types.Edge;
 pub const SyncMode = db_mod.SyncMode;
+pub const CompactionStyle = db_mod.CompactionStyle;
 pub const Options = db_mod.Options;
 pub const Db = db_mod.Db;
 pub const Snapshot = db_mod.Snapshot;
@@ -14,6 +15,7 @@ pub const max_levels = @import("version.zig").max_levels;
 pub const LevelStats = db_mod.LevelStats;
 pub const EdgeIter = db_mod.EdgeIter;
 pub const Batch = batch_mod.Batch;
+pub const spectral = @import("spectral.zig");
 
 test {
     _ = @import("sys.zig");
@@ -23,4 +25,6 @@ test {
     _ = @import("version.zig");
     _ = @import("compaction.zig");
     _ = @import("db_test.zig");
+    _ = @import("spectral_test.zig");
+    _ = @import("fuzz_test.zig");
 }

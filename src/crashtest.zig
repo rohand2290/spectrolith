@@ -8,13 +8,15 @@
 //!   3. the recovered graph equals a model that replays the same batches,
 //!   4. recovery is idempotent and the log keeps accepting writes afterwards.
 //!
-//! usage: crashtest [rounds=50] [seed=1] [dir=.zig-cache/crashtest]
+//! usage: crashtest [rounds=50] [seed=1] [dir=.zig-cache/crashtest] [leveled|tiered]
 //! A failing round prints its seed and round number.
 const std = @import("std");
 const c = std.c;
 const sp = @import("spectrolith");
 
 const base_dst: u64 = 1_000_000;
+
+var style: sp.CompactionStyle = .leveled;
 
 /// Tiny MemGraph limit so the child flushes a segment every ~10 batches and
 /// kills land inside flushes (segment write, rename, log swap) too.
@@ -25,6 +27,7 @@ const memgraph_limit: usize = 1500;
 /// manifest appends and file deletions.
 fn dbOptions(dir: []const u8) sp.Options {
     return .{
+        .compaction_style = style,
         .path = dir,
         .memgraph_limit_bytes = memgraph_limit,
         .l0_compaction_trigger = 2,
@@ -114,6 +117,19 @@ fn verify(gpa: std.mem.Allocator, db: *sp.Db, n_batches: u64) !void {
     if (s_total != model.count()) return error.EdgeCountMismatch;
 }
 
+fn countLogs(gpa: std.mem.Allocator, dir: []const u8) usize {
+    const d = gpa.dupeSentinel(u8, dir, 0) catch return 0;
+    defer gpa.free(d);
+    const dp = c.opendir(d) orelse return 0;
+    defer _ = c.closedir(dp);
+    var n: usize = 0;
+    while (c.readdir(dp)) |ent| {
+        const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.name)), 0);
+        if (std.mem.endsWith(u8, name, ".log")) n += 1;
+    }
+    return n;
+}
+
 fn removeDir(gpa: std.mem.Allocator, dir: []const u8) void {
     const d = gpa.dupeSentinel(u8, dir, 0) catch return;
     defer gpa.free(d);
@@ -142,6 +158,7 @@ pub fn main(init: std.process.Init) !void {
     const rounds: u32 = if (args.len > 1) try std.fmt.parseInt(u32, args[1], 10) else 50;
     const seed: u64 = if (args.len > 2) try std.fmt.parseInt(u64, args[2], 10) else 1;
     const root: []const u8 = if (args.len > 3) args[3] else ".zig-cache/crashtest";
+    if (args.len > 4) style = std.meta.stringToEnum(sp.CompactionStyle, args[4]) orelse return error.Usage;
 
     {
         const rz = try gpa.dupeSentinel(u8, ".zig-cache", 0);
@@ -157,6 +174,7 @@ pub fn main(init: std.process.Init) !void {
 
     var total_acked: u64 = 0;
     var total_recovered: u64 = 0;
+    var mid_flush: u32 = 0;
     var round: u32 = 0;
     while (round < rounds) : (round += 1) {
         const dir = try std.fmt.allocPrint(gpa, "{s}/round-{d}", .{ root, round });
@@ -175,9 +193,10 @@ pub fn main(init: std.process.Init) !void {
         }
         _ = c.close(fds[1]);
 
-        // Log-uniform delay, 0 to ~4 s, (after a 4 ms floor for process start) so kills land in creation, in the
-        // middle of appends, and between batches.
-        const delay_us: u64 = 4000 + rnd.uintLessThan(u64, @as(u64, 1) << @intCast(rnd.uintLessThan(u6, 22)));
+        // Log-spaced delay, 8 ms to ~1 s. Each fsync takes milliseconds, so
+        // anything much shorter dies before the first ack; this range lands in
+        // creation, appends, flushes and compactions.
+        const delay_us: u64 = 8000 + rnd.uintLessThan(u64, @as(u64, 1) << @intCast(14 + rnd.uintLessThan(u6, 7)));
         var ts: c.timespec = .{ .sec = @intCast(delay_us / 1_000_000), .nsec = @intCast((delay_us % 1_000_000) * 1000) };
         _ = c.nanosleep(&ts, null);
         _ = c.kill(pid, .KILL);
@@ -188,6 +207,9 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("FAIL seed={d} round={d}: child exited on its own (status {d}) instead of being killed\n", .{ seed, round, status });
             return error.ChildFailed;
         }
+
+        // More than one log at the kill: rotated, but the flush had not finished.
+        if (countLogs(gpa, dir) > 1) mid_flush += 1;
 
         // Drain acks. The write end is closed (child dead, ours closed) so read hits EOF.
         var acked: u64 = 0; // number of acknowledged batches
@@ -251,5 +273,5 @@ pub fn main(init: std.process.Init) !void {
             round, delay_us, acked, j, segs, if (j > acked) "  (+1 unacked batch survived)" else "",
         });
     }
-    std.debug.print("PASS: {d} rounds, {d} acknowledged batches, 0 lost (seed {d})\n", .{ rounds, total_acked, seed });
+    std.debug.print("PASS: {d} rounds ({d} killed mid-flush), {d} acknowledged batches, 0 lost (seed {d})\n", .{ rounds, mid_flush, total_acked, seed });
 }

@@ -12,3 +12,7 @@ zig-out/
 .vscode/
 .idea/
 *.swp
+
+# Benchmark inputs and working directories (scripts/fetch_data.sh recreates them)
+data/
+bench-work/

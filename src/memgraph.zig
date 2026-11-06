@@ -55,9 +55,18 @@ pub const MemGraph = struct {
         }
     }
 
-    /// Copy the records of vertex `v` with seq <= snap_seq into `out`, sorted
-    /// by (dst asc, seq desc). Copying under the shared lock means the caller
-    /// can sort and merge without holding it.
+    /// Append every vertex id to `out`.
+    pub fn keys(m: *MemGraph, gpa: Allocator, out: *std.ArrayList(u64)) Allocator.Error!void {
+        m.lock.lockShared();
+        defer m.lock.unlock();
+        try out.ensureUnusedCapacity(gpa, m.adj.count());
+        var it = m.adj.keyIterator();
+        while (it.next()) |k| out.appendAssumeCapacity(k.*);
+    }
+
+    /// Append the records of vertex `v` with seq <= snap_seq to `out`, then
+    /// sort all of `out` by (dst asc, seq desc). Copying under the shared lock
+    /// means the caller can sort and merge without holding it.
     pub fn collect(m: *MemGraph, gpa: Allocator, v: u64, snap_seq: u64, out: *std.ArrayList(EdgeRec)) Allocator.Error!void {
         {
             m.lock.lockShared();

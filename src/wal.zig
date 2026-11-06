@@ -163,6 +163,8 @@ pub fn replay(gpa: Allocator, bytes: []const u8, sink: anytype) types.Error!Repl
         const count: usize = std.mem.readInt(u32, body[9..13], .little);
         if ((body.len - batch_mod.record_overhead) != count * batch_mod.op_wire_bytes) return error.Corrupt;
         if (count == 0 or first_seq == 0) return error.Corrupt;
+        // The next sequence number after this batch must exist too.
+        const next_seq = std.math.add(u64, first_seq, count) catch return error.Corrupt;
         if (res.last_seq != 0 and first_seq != res.last_seq + 1) return error.Corrupt; // gap or overlap
 
         ops.clearRetainingCapacity();
@@ -184,7 +186,7 @@ pub fn replay(gpa: Allocator, bytes: []const u8, sink: anytype) types.Error!Repl
         }
         try sink.applyReplay(first_seq, ops.items);
 
-        res.last_seq = first_seq + count - 1;
+        res.last_seq = next_seq - 1;
         res.batches += 1;
         off = end;
         res.valid_len = off;
@@ -223,6 +225,21 @@ fn buildLog(gpa: Allocator, out: *std.ArrayList(u8), n_batches: usize, rec_ends:
         try rec_ends.append(gpa, out.items.len);
         seq += ops.len;
     }
+}
+
+test "a record whose sequence numbers run off the end of u64 is refused" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    var rb: std.ArrayList(u8) = .empty;
+    defer rb.deinit(std.testing.allocator);
+    try buf.appendSlice(std.testing.allocator, header_magic);
+    const ops = [_]Op{.{ .kind = .put, .src = 1, .dst = 2, .weight = 1 }};
+    try encodeRecord(&rb, std.testing.allocator, std.math.maxInt(u64), &ops); // CRC is valid
+    try buf.appendSlice(std.testing.allocator, rb.items);
+    var sink: Collect = .{ .gpa = std.testing.allocator };
+    defer sink.deinit();
+    try std.testing.expectError(error.Corrupt, replay(std.testing.allocator, buf.items, &sink));
+    try std.testing.expectEqual(@as(usize, 0), sink.ops.items.len);
 }
 
 test "wal: round trip" {

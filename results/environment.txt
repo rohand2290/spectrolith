@@ -1,0 +1,8 @@
+date: 2026-11-06T03:36:07Z
+commit: f336750 + uncommitted changes
+zig: 0.17.0
+rocksdb: 11.13.2
+cpu: Apple M4, 10 threads
+memory_gib: 16
+os: Darwin 25.6.0
+reps: 3

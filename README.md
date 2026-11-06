@@ -8,7 +8,7 @@ The storage design follows LSMGraph (SIGMOD 2025): LSM-tree levels for write thr
 
 ## Status
 
-This is a WIP. The full design is written up, but phases 1 to 4 are implemented:
+All six phases of the design are implemented:
 
 | Part | State |
 | --- | --- |
@@ -21,9 +21,12 @@ This is a WIP. The full design is written up, but phases 1 to 4 are implemented:
 | CSR segment files (writer, validating mmap reader), flush to L0, merged neighbor scans | Implemented |
 | Refcounted versions, manifest, `CURRENT`, recovery of the level layout | Implemented |
 | Leveled compaction (picker, merge, garbage collection, output splitting, write stalls, per-level stats) | Implemented |
-| Tiered compaction policy | Not started (the policy interface is in place) |
-| Spectral engine (CSR view, Fiedler vector, delta operator) | Not started |
-| Benchmarks against RocksDB | Not started |
+| Background flush thread | Implemented |
+| Tiered compaction policy | Implemented |
+| Per-segment vertex bloom filters | Implemented |
+| Spectral engine (CSR view, Fiedler vector, centrality, delta operator, warm starts, Lanczos) | Implemented |
+| Fuzzing of the segment, WAL and manifest readers | Implemented |
+| Benchmarks against RocksDB | Implemented, see [BENCHMARKS.md](BENCHMARKS.md) |
 
 
 ## Goals
@@ -45,10 +48,13 @@ Some things outside of the scope: distribution or replication, a query language,
 ```sh
 zig build test                  # unit tests
 zig build test -Dtsan=true      # unit tests under ThreadSanitizer
-zig build crashtest -- 50 1234  # kill -9 test: <rounds> <seed>
+zig build crashtest -- 50 1234  # kill -9 test: <rounds> <seed> [dir] [leveled|tiered]
+zig build test --fuzz=1M        # coverage-guided fuzzing of the file readers
 ```
 
-The crash test forks a child that writes batches and reports each acknowledged one over a pipe. The parent kills the child at a random moment with `SIGKILL`, reopens the database, and checks that every acknowledged batch is present and was applied atomically.
+The crash test forks a child that writes batches and reports each acknowledged one over a pipe. The parent kills the child at a random moment with `SIGKILL`, reopens the database, and checks that every acknowledged batch is present and was applied atomically. It reports how many rounds were killed between freezing a MemGraph and installing its segment.
+
+`zig build test` already runs each file reader against tens of thousands of seeded mutations with their CRCs repaired, so the damage reaches the structural checks behind the checksum. `--fuzz` adds Zig's coverage-guided fuzzer on the same targets.
 
 For extra checking, run the tests in both Debug and ReleaseSafe (`-Doptimize=ReleaseSafe`). Both trap out-of-bounds indexing and integer overflow, and the tests use `std.testing.allocator`, so leaks fail the test.
 
@@ -78,21 +84,41 @@ Notes on the API:
 - Anything that allocates takes a `std.mem.Allocator`.
 - `Db.write` takes a `Batch` and applies all of it or none of it.
 - `Options.background_compaction` (default true) runs compaction on a thread. With `false`, nothing compacts until you call `db.compactOnce()`, `db.compactLevel(n)` or `db.waitForCompaction()`.
-- `db.stats()` reports, per level, files, bytes, compactions, bytes read and bytes written, plus flushes, stall count and time, and records dropped as garbage.
+- `db.flush()` blocks until the data is in L0. `db.waitForFlush()` waits for a flush already under way. Normal writes never wait for a flush unless the previous one is still running.
+- `Options.compaction_style` is `.leveled` (the default) or `.tiered`. The policy is not recorded on disk: a tiered store refuses to open as leveled, the reverse works.
+- `Options.bloom_bits_per_vertex` (default 10, 0 for none) sizes each segment's bloom filter.
+- `db.stats()` reports, per level, files, bytes, compactions, bytes read and bytes written, plus flushes, stall count and time, records dropped as garbage, `writeAmp()` overall and per level, and `readAmp()`, the runs merged per scan. `db.spaceAmp()` measures bytes on disk per byte of live data.
 - `Options.sync_mode` is `.every` (fsync the log on every write, the default) or `.none`.
 - With `undirected = true` (the default), each edge is stored in both directions in the same batch.
 
 ## How it works
 
-**Writes.** A batch gets a range of sequence numbers, is appended to the WAL, is applied to the active MemGraph, and is then published by advancing `last_seq`. Readers never see a write that is not already in the log. When the MemGraph reaches its size limit, it is flushed to an L0 segment by the writer that hit the limit. That write waits if L0 already holds `l0_stop_trigger` files, and the wait is counted in `stats().stall_ns`.
+**Writes.** A batch gets a range of sequence numbers, is appended to the WAL, is applied to the active MemGraph, and is then published by advancing `last_seq`. Readers never see a write that is not already in the log. When the MemGraph reaches its size limit, the writer freezes it, starts a new MemGraph and a new log, and carries on while a dedicated flush thread writes the frozen one out as an L0 segment. A write waits only if the previous flush is still running or L0 already holds `l0_stop_trigger` files, and the wait is counted in `stats().stall_ns`.
 
 **Storage.** Each edge record is 24 bytes: destination, sequence number, weight and flags (one flag marks a delete). Within a vertex, records are sorted by destination ascending and then sequence number descending, so the first record for a destination that is visible to a snapshot is the current one. Segments are written once, never modified, and read through `mmap`. Levels L1 and deeper hold disjoint vertex ranges and each is `size_ratio` times larger than the one above.
 
-**Reads.** A snapshot is a sequence number plus references to the MemGraphs and the version of the segment layout that were current when it was taken. Those references keep files alive until the snapshot is released: a segment that compaction has replaced is deleted when the last older version lets go of it. A neighbor scan merges one sorted run from each source through a priority queue and returns the newest visible version of each edge, skipping deleted ones.
+**Reads.** A snapshot is a sequence number plus references to the MemGraphs and the version of the segment layout that were current when it was taken. Those references keep files alive until the snapshot is released: a segment that compaction has replaced is deleted when the last older version lets go of it. A scan skips a segment that its bloom filter rules out, then merges one sorted run from each source through a priority queue and returns the newest visible version of each edge, skipping deleted ones.
 
-**Compaction.** A background thread scores every level (L0 by file count, deeper levels by bytes against `level1_bytes * size_ratio^(n-1)`) and compacts the highest score that is at least 1. L0 compacts all of its files with the L1 segments they overlap; a deeper level compacts one segment, rotating through the level, with the segments below it that overlap. Output is cut into `target_segment_bytes` segments at vertex boundaries, so L1 and deeper stay disjoint, and one edit swaps inputs for outputs atomically. A version of an edge is dropped once a newer one is visible to the oldest live snapshot. A delete marker is dropped only when no deeper level overlaps the compaction's vertex range, because dropping it earlier could bring back an older copy of the edge. A tiered policy will sit behind the same `CompactionPolicy` interface so the two can be benchmarked.
+**Compaction.** A background thread scores every level (L0 by file count, deeper levels by bytes against `level1_bytes * size_ratio^(n-1)`) and compacts the highest score that is at least 1. L0 compacts all of its files with the L1 segments they overlap; a deeper level compacts one segment, rotating through the level, with the segments below it that overlap. Output is cut into `target_segment_bytes` segments at vertex boundaries, so L1 and deeper stay disjoint, and one edit swaps inputs for outputs atomically. A version of an edge is dropped once a newer one is visible to the oldest live snapshot. A delete marker is dropped only when no deeper level overlaps the compaction's vertex range, because dropping it earlier could bring back an older copy of the edge. A delete marker dropped under the tiered policy must also have no older run left on the output level. The tiered policy sits behind the same `CompactionPolicy` interface: each level holds up to `size_ratio` overlapping runs of one file each, and a full level merges into one new run below, without rewriting what is already there.
 
-**Spectral operators.** The algorithms are written against a matrix-free linear operator interface (`y = Op x`). The planned set is normalized adjacency, the Fiedler vector by deflated power iteration, and eigenvector centrality. Each snapshot gets a cached in-memory CSR view of its segments, and recent MemGraph changes are applied as a small correction on top. The previous Fiedler vector is reused as a warm start after new edges arrive.
+**Spectral operators.** The algorithms are written against a matrix-free linear operator interface (`y = Op x`) and live in `spectrolith.spectral`.
+
+```zig
+const snap = try db.snapshot();
+defer snap.release();
+
+var run = try spectrolith.spectral.fiedlerOf(gpa, snap, .{ .method = .lanczos });
+defer run.deinit();
+// run.vid and run.value: the Fiedler vector on the largest connected component.
+// run.lambda2, run.converged, run.residual
+
+var next = try spectrolith.spectral.fiedlerOf(gpa, newer_snap, .{ .warm = &run });
+defer next.deinit();
+```
+
+The adjacency of a snapshot is a base plus a correction. `CsrView` merges every level of one version, and is cached on that version, because every record in a version is visible to every snapshot holding it. `Delta` holds what the snapshot's MemGraphs change on top, computed as target weight minus base weight, so a record that is briefly in both a new segment and the frozen MemGraph counts once. Operators stack as decorators: adjacency, then the delta, then the shifted normalized form `(I + D^-1/2 A D^-1/2) / 2`, whose spectrum lies in [0, 1].
+
+`fiedlerOf` runs deflated power iteration or restarted Lanczos. Lanczos needs far fewer operator applications when the spectral gap is small, at the cost of holding `lanczos_basis` vectors in memory. Check `converged`: power iteration can run out of `max_iter` when the second and third eigenvalues are close. `centralityOf` gives eigenvector centrality by power iteration on `(I + A) / 2`. Both work on the largest connected component, and need an undirected store with non-negative weights; anything else is `error.InvalidArgument`. A previous result can be passed as `warm`, matched by vertex id, with new vertices starting at 0.
 
 **Recovery.** On open, the database takes a lock file, reads `CURRENT` and the manifest it names to rebuild the level layout, opens and checks every segment the manifest lists, and deletes segment files it does not list (a flush or compaction that crashed before its edit). It then replays any WALs numbered at least the manifest's log number and writes a fresh manifest holding the whole layout. Replay stops at the first record with a bad checksum or a short length, which is treated as a torn tail from the crash and not as corruption. The same rule applies to the last record of the manifest. A damaged record with acknowledged records after it, or a listed segment that is missing, fails the open.
 
@@ -103,7 +129,8 @@ Notes on the API:
 | `src/spectrolith.zig` | Public API |
 | `src/db.zig` | `Db`, open/recovery, flush, compaction thread and stalls, snapshots, neighbor iterator |
 | `src/version.zig` | `Version`, `VersionEdit`, `VersionSet`, manifest and `CURRENT` |
-| `src/compaction.zig` | `CompactionPolicy`, `Leveled`, merge and garbage collection |
+| `src/compaction.zig` | `CompactionPolicy`, `Leveled`, `Tiered`, merge and garbage collection |
+| `src/spectral.zig` | `LinOp`, `CsrView`, `Delta`, power iteration, Lanczos, centrality |
 | `src/merge.zig` | Sorted runs and their heap order, shared by scans and compaction |
 | `src/segment.zig` | CSR segment writer and validating mmap reader |
 | `src/memgraph.zig` | In-memory adjacency buffer |
@@ -111,15 +138,22 @@ Notes on the API:
 | `src/batch.zig` | Write batches |
 | `src/types.zig` | Shared types such as `EdgeRec` |
 | `src/sys.zig` | Thin wrappers over POSIX calls |
-| `src/db_test.zig` | Unit tests |
+| `src/db_test.zig`, `src/spectral_test.zig` | Unit and model-based tests |
+| `src/fuzz_test.zig` | Fuzz targets and seeded mutation tests for the file readers |
 | `src/crashtest.zig` | `kill -9` crash test |
+| `src/fiedlercheck.zig`, `scripts/check_fiedler.py` | Numerical check against SciPy |
+| `src/bench.zig`, `src/rocks_engine.zig`, `scripts/` | Benchmarks, RocksDB baseline, charts |
 
-## Planned testing and benchmarks
+## Numerical check and benchmarks
 
-- More seeds for the model-based test. It already compares every snapshot, including frozen ones held across compactions and reopens, against an in-memory reference, in a background-compaction run and in a run that triggers compactions at random points; the seed is printed on failure.
-- Fuzzing of the segment reader and WAL parser on corrupt input.
-- A numerical check of the Fiedler vector and eigenvalue against `scipy.sparse.linalg.eigsh`.
-- Benchmarks on the STRING human PPI graph and a SNAP social graph: ingest rate, p50 and p99 insert latency, stall time, scan latency, and per-level amplification. The baseline is RocksDB used through its C API with a `src|dst` key.
+The numerical check loads a graph so that it is spread across compacted segments and live MemGraphs, solves on a snapshot, and exports what that snapshot sees. `scripts/check_fiedler.py` then checks that the export is exactly the input graph, solves it with `scipy.sparse.linalg.eigsh`, and compares the Fiedler vector and eigenvalue.
+
+```sh
+scripts/fetch_data.sh       # STRING human PPI and com-LiveJournal, about 200 MB
+scripts/run_benchmarks.sh   # every number and chart in results/, from scratch
+```
+
+Findings are in [BENCHMARKS.md](BENCHMARKS.md), and the generated tables and charts in [results/RESULTS.md](results/RESULTS.md).
 
 ## References
 
