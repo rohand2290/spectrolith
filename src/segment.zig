@@ -65,7 +65,7 @@ pub fn parseSegName(name: []const u8) ?u64 {
     return std.fmt.parseInt(u64, name[0 .. name.len - suffix.len], 10) catch null;
 }
 
-/// What the manifest (phase 3) will record about a segment.
+/// Facts about a finished segment file.
 pub const Meta = struct {
     level: u16,
     n_vertices: u64,
@@ -96,6 +96,21 @@ pub const SegWriter = struct {
     pub fn deinit(w: *SegWriter) void {
         w.vidx.deinit(w.gpa);
         w.edges.deinit(w.gpa);
+    }
+
+    /// Forget everything added so far, keeping the buffers, to start the next
+    /// output segment.
+    pub fn reset(w: *SegWriter) void {
+        w.vidx.clearRetainingCapacity();
+        w.edges.clearRetainingCapacity();
+        w.min_seq = std.math.maxInt(u64);
+        w.max_seq = 0;
+    }
+
+    /// Bytes of edge records buffered so far; compaction closes an output
+    /// segment (at a vertex boundary) once this passes its target.
+    pub fn edgeBytes(w: *const SegWriter) u64 {
+        return @as(u64, w.edges.items.len) * @sizeOf(EdgeRec);
     }
 
     /// `recs` must already be sorted by (dst asc, seq desc) and non-empty;
@@ -174,6 +189,10 @@ pub const SegWriter = struct {
 pub const Segment = struct {
     gpa: Allocator,
     refs: std.atomic.Value(u32) = .init(1),
+    /// Set once no live Version lists this segment. The file is unlinked when
+    /// the last reference (an older Version or a snapshot) lets go.
+    obsolete: std.atomic.Value(bool) = .init(false),
+    path: [:0]u8,
     file_no: u64,
     level: u16,
     min_vid: u64,
@@ -223,9 +242,12 @@ pub const Segment = struct {
         const edges: []const EdgeRec = @alignCast(std.mem.bytesAsSlice(EdgeRec, eb));
         try validateIndex(hdr, vidx, edges);
 
+        const path_copy = try gpa.dupeSentinel(u8, std.mem.span(path), 0);
+        errdefer gpa.free(path_copy);
         const s = try gpa.create(Segment);
         s.* = .{
             .gpa = gpa,
+            .path = path_copy,
             .file_no = file_no,
             .level = hdr.level,
             .min_vid = hdr.min_vid,
@@ -278,7 +300,20 @@ pub const Segment = struct {
     pub fn unref(s: *Segment) void {
         if (s.refs.fetchSub(1, .acq_rel) != 1) return;
         sys.unmap(s.map);
+        if (s.obsolete.load(.acquire)) sys.unlink(s.path);
+        s.gpa.free(s.path);
         s.gpa.destroy(s);
+    }
+
+    /// Mark the file for deletion when the last reference is dropped. Called
+    /// only after the manifest edit that removes the segment is durable.
+    pub fn markObsolete(s: *Segment) void {
+        s.obsolete.store(true, .release);
+    }
+
+    /// File size in bytes.
+    pub fn bytes(s: *const Segment) u64 {
+        return s.map.len;
     }
 
     /// The records of `vid` in (dst asc, seq desc) order, or empty.

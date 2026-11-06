@@ -155,6 +155,29 @@ pub const Mutex = struct {
     }
 };
 
+pub const Cond = struct {
+    cv: c.pthread_cond_t = .{},
+
+    /// Atomically releases `mu` and sleeps; `mu` is held again on return.
+    /// Spurious wakeups happen, so callers re-check their condition in a loop.
+    pub fn wait(cv: *Cond, mu: *Mutex) void {
+        _ = c.pthread_cond_wait(&cv.cv, &mu.m);
+    }
+    pub fn signal(cv: *Cond) void {
+        _ = c.pthread_cond_signal(&cv.cv);
+    }
+    pub fn broadcast(cv: *Cond) void {
+        _ = c.pthread_cond_broadcast(&cv.cv);
+    }
+};
+
+/// Monotonic clock in nanoseconds (for stall accounting).
+pub fn nanoTime() u64 {
+    var ts: c.timespec = undefined;
+    _ = c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
 pub const RwLock = struct {
     l: c.pthread_rwlock_t = .{},
 
@@ -168,6 +191,21 @@ pub const RwLock = struct {
         _ = c.pthread_rwlock_unlock(&rw.l);
     }
 };
+
+/// Replace `final` with `bytes` so that a crash leaves the old or the new
+/// contents, never a mix: write `tmp`, fsync it, rename over `final`, fsync the
+/// directory.
+pub fn replaceFileDurably(tmp: [*:0]const u8, final: [*:0]const u8, dir: [*:0]const u8, bytes: []const u8) Error!void {
+    {
+        const f = try File.open(tmp, .read_write_create);
+        defer f.close();
+        try f.truncate(0);
+        try f.writeAll(bytes);
+        try f.sync();
+    }
+    try rename(tmp, final);
+    try syncDir(dir);
+}
 
 pub fn rename(from: [*:0]const u8, to: [*:0]const u8) Error!void {
     if (c.rename(from, to) != 0) return error.Io;

@@ -20,6 +20,21 @@ const base_dst: u64 = 1_000_000;
 /// kills land inside flushes (segment write, rename, log swap) too.
 const memgraph_limit: usize = 1500;
 
+/// Tiny levels as well, so a flush every ~10 batches also triggers L0 -> L1 and
+/// deeper compactions on the background thread, and kills land inside merges,
+/// manifest appends and file deletions.
+fn dbOptions(dir: []const u8) sp.Options {
+    return .{
+        .path = dir,
+        .memgraph_limit_bytes = memgraph_limit,
+        .l0_compaction_trigger = 2,
+        .l0_stop_trigger = 4,
+        .size_ratio = 2,
+        .level1_bytes = 4096,
+        .target_segment_bytes = 1024,
+    };
+}
+
 /// Op list of batch `i`. Deterministic, so the parent can rebuild any prefix.
 fn batchOps(gpa: std.mem.Allocator, b: *sp.Batch, i: u64) !void {
     b.clear();
@@ -40,7 +55,7 @@ fn childMain(gpa: std.mem.Allocator, dir: []const u8, ack_fd: c_int) noreturn {
 }
 
 fn run(gpa: std.mem.Allocator, dir: []const u8, ack_fd: c_int) !void {
-    const db = try sp.Db.open(gpa, .{ .path = dir, .memgraph_limit_bytes = memgraph_limit });
+    const db = try sp.Db.open(gpa, dbOptions(dir));
     var b: sp.Batch = .{};
     var i: u64 = 0;
     while (i < 1_000_000) : (i += 1) {
@@ -160,9 +175,9 @@ pub fn main(init: std.process.Init) !void {
         }
         _ = c.close(fds[1]);
 
-        // Log-uniform delay, 0 to ~260 ms, (after a 4 ms floor for process start) so kills land in creation, in the
+        // Log-uniform delay, 0 to ~4 s, (after a 4 ms floor for process start) so kills land in creation, in the
         // middle of appends, and between batches.
-        const delay_us: u64 = 4000 + rnd.uintLessThan(u64, @as(u64, 1) << @intCast(rnd.uintLessThan(u6, 19)));
+        const delay_us: u64 = 4000 + rnd.uintLessThan(u64, @as(u64, 1) << @intCast(rnd.uintLessThan(u6, 22)));
         var ts: c.timespec = .{ .sec = @intCast(delay_us / 1_000_000), .nsec = @intCast((delay_us % 1_000_000) * 1000) };
         _ = c.nanosleep(&ts, null);
         _ = c.kill(pid, .KILL);
@@ -199,7 +214,7 @@ pub fn main(init: std.process.Init) !void {
         }.at;
 
         // Recover.
-        const db = sp.Db.open(gpa, .{ .path = dir, .memgraph_limit_bytes = memgraph_limit }) catch |err| return fail(seed, round, "reopen failed: {s}", .{@errorName(err)});
+        const db = sp.Db.open(gpa, dbOptions(dir)) catch |err| return fail(seed, round, "reopen failed: {s}", .{@errorName(err)});
         const last = db.lastSeq();
         const segs = db.segmentCount();
 
@@ -217,14 +232,14 @@ pub fn main(init: std.process.Init) !void {
 
         // Recovery is idempotent, and the log accepts writes after it.
         {
-            const db2 = try sp.Db.open(gpa, .{ .path = dir, .memgraph_limit_bytes = memgraph_limit });
+            const db2 = try sp.Db.open(gpa, dbOptions(dir));
             if (db2.lastSeq() != last) return fail(seed, round, "second recovery changed last_seq", .{});
             var b: sp.Batch = .{};
             defer b.deinit(gpa);
             try batchOps(gpa, &b, j);
             try db2.write(&b);
             db2.close();
-            const db3 = try sp.Db.open(gpa, .{ .path = dir, .memgraph_limit_bytes = memgraph_limit });
+            const db3 = try sp.Db.open(gpa, dbOptions(dir));
             defer db3.close();
             if (db3.lastSeq() != last + seqsInBatch(j)) return fail(seed, round, "write after recovery was lost", .{});
             verify(gpa, db3, j + 1) catch |err| return fail(seed, round, "content mismatch after write-after-recovery: {s}", .{@errorName(err)});

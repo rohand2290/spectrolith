@@ -323,6 +323,23 @@ fn countFiles(dir: [:0]const u8, suffix: []const u8) !usize {
     return n;
 }
 
+/// Path of the single file in `dir` ending in `suffix`.
+fn onlyFile(dir: [:0]const u8, suffix: []const u8) ![:0]u8 {
+    const names = try sys.listDir(testing.allocator, dir);
+    defer {
+        for (names) |n| testing.allocator.free(n);
+        testing.allocator.free(names);
+    }
+    var found: ?[:0]u8 = null;
+    errdefer if (found) |f| testing.allocator.free(f);
+    for (names) |name| {
+        if (!std.mem.endsWith(u8, name, suffix)) continue;
+        try testing.expect(found == null);
+        found = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/{s}", .{ dir, name }, 0);
+    }
+    return found orelse error.FileNotFound;
+}
+
 test "flush writes an L0 segment; reads merge segment and MemGraph; reopen keeps both" {
     var tmp = try TmpDir.init();
     defer tmp.deinit();
@@ -393,6 +410,7 @@ test "automatic flush at the MemGraph limit" {
         .undirected = false,
         .sync_mode = .none,
         .memgraph_limit_bytes = 24 * 100,
+        .background_compaction = false,
     });
     defer db.close();
     for (0..1000) |i| try db.putEdge(i % 10, i, 1);
@@ -459,7 +477,7 @@ test "open refuses a corrupt segment" {
         try db.putEdge(1, 2, 1);
         try db.flush();
     }
-    const p = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/000002.seg", .{tmp.path}, 0);
+    const p = try onlyFile(tmp.path, ".seg");
     defer testing.allocator.free(p);
     {
         const f = try sys.File.open(p, .read);
@@ -520,20 +538,39 @@ fn expectMatches(seed: u64, at_op: usize, label: []const u8, snap: *sp.Snapshot,
     }
 }
 
-test "model: 1M random ops, flushes, frozen snapshots and reopens match the reference" {
-    const seed: u64 = 0x5eed_2;
-    const total_ops: usize = 1_000_000;
+test "model: 1M random ops, flushes, background compaction, frozen snapshots and reopens match the reference" {
+    try runModel(0x5eed_2, 1_000_000, true);
+}
+
+test "model: random manual compactions at every level never resurrect a delete" {
+    try runModel(0x5eed_3, 600_000, false);
+}
+
+/// Small levels so data really descends: ~1 MiB flushes, L1 holds 1 MiB, each
+/// level 3x the one above, output segments of 128 KiB (many per level, so the
+/// disjoint-range handling is exercised too).
+fn compactingOptions(path: [:0]const u8, bg: bool) sp.Options {
+    return .{
+        .path = path,
+        .undirected = false,
+        .sync_mode = .none,
+        .memgraph_limit_bytes = 1 << 20,
+        .l0_compaction_trigger = 3,
+        .l0_stop_trigger = 6,
+        .size_ratio = 3,
+        .level1_bytes = 1 << 20,
+        .target_segment_bytes = 128 << 10,
+        .background_compaction = bg,
+    };
+}
+
+fn runModel(seed: u64, total_ops: usize, bg: bool) !void {
     var prng = std.Random.DefaultPrng.init(seed);
     const rnd = prng.random();
 
     var tmp = try TmpDir.init();
     defer tmp.deinit();
-    const opts: sp.Options = .{
-        .path = tmp.path,
-        .undirected = false,
-        .sync_mode = .none,
-        .memgraph_limit_bytes = 1 << 20, // ~43k records: about 20 flushes
-    };
+    const opts = compactingOptions(tmp.path, bg);
     var db = try Db.open(testing.allocator, opts);
     var open = true;
     defer if (open) db.close();
@@ -577,6 +614,15 @@ test "model: 1M random ops, flushes, frozen snapshots and reopens match the refe
         done += n;
 
         if (rnd.uintLessThan(u32, 40_000) == 0) try db.flush();
+        if (!bg and rnd.uintLessThan(u32, 3_000) == 0) {
+            // Deterministic compactions at random points, any level, with
+            // frozen snapshots outstanding.
+            if (rnd.boolean()) {
+                _ = try db.compactOnce();
+            } else {
+                _ = try db.compactLevel(rnd.uintLessThan(u16, 4));
+            }
+        }
 
         if (done >= next_check) {
             next_check += 100_000;
@@ -604,8 +650,465 @@ test "model: 1M random ops, flushes, frozen snapshots and reopens match the refe
         }
     }
     try testing.expect(reopens >= 2);
-    try testing.expect(try countFiles(tmp.path, ".seg") >= 10);
-    const last = try db.snapshot();
-    defer last.release();
-    try expectMatches(seed, done, "final", last, model);
+    try db.waitForCompaction();
+    {
+        const last = try db.snapshot();
+        defer last.release();
+        try expectMatches(seed, done, "final", last, model);
+    }
+
+    // Compaction really ran and really collected garbage.
+    const st = db.stats();
+    var compactions: u64 = 0;
+    for (st.levels) |l| compactions += l.compactions;
+    try testing.expect(compactions >= 5);
+    try testing.expect(st.dropped_records > 0);
+    try testing.expect(st.levels[1].files > 0);
+    try testing.expect(db.levelFileCounts()[0] < 3 or !bg); // L0 stays bounded
+
+    // Release the frozen snapshots: every obsolete file must then be gone, so
+    // the directory holds exactly the segments of the current layout.
+    for (frozen.items) |f| {
+        f.snap.release();
+        f.model.deinit();
+    }
+    frozen.clearRetainingCapacity();
+    try testing.expectEqual(db.segmentCount(), try countFiles(tmp.path, ".seg"));
+
+    // And the compacted layout survives a reopen.
+    db.close();
+    open = false;
+    db = try Db.open(testing.allocator, opts);
+    open = true;
+    try db.waitForCompaction();
+    const again = try db.snapshot();
+    defer again.release();
+    try expectMatches(seed, done, "final after reopen", again, model);
+}
+
+// ---- phase 3: versions, manifest, recovery -----------------------------------
+
+fn collectDsts(snap: *sp.Snapshot, v: u64) !usize {
+    var it = try snap.neighbors(testing.allocator, v);
+    defer it.deinit();
+    var n: usize = 0;
+    while (it.next()) |_| n += 1;
+    return n;
+}
+
+fn manualOpts(path: [:0]const u8) sp.Options {
+    return .{
+        .path = path,
+        .undirected = false,
+        .background_compaction = false,
+        .target_segment_bytes = 1 << 20,
+    };
+}
+
+fn overwriteFile(path: [*:0]const u8, bytes: []const u8) !void {
+    const w = try sys.File.open(path, .read_write_create);
+    defer w.close();
+    try w.truncate(0);
+    try w.writeAll(bytes);
+}
+
+test "the level layout survives a reopen, including compacted levels" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    var layout: [sp.max_levels]usize = undefined;
+    {
+        const db = try Db.open(testing.allocator, manualOpts(tmp.path));
+        defer db.close();
+        for (0..3) |round| {
+            for (0..50) |i| try db.putEdge(i, 1000 + round, 1);
+            try db.flush();
+        }
+        try testing.expect(try db.compactLevel(0)); // L0 -> L1
+        for (0..50) |i| try db.putEdge(i, 2000, 1);
+        try db.flush(); // a fresh L0 on top of L1
+        layout = db.levelFileCounts();
+        try testing.expectEqual(@as(usize, 1), layout[0]);
+        try testing.expect(layout[1] >= 1);
+    }
+    const db = try Db.open(testing.allocator, manualOpts(tmp.path));
+    defer db.close();
+    try testing.expectEqualSlices(usize, &layout, &db.levelFileCounts());
+    const s = try db.snapshot();
+    defer s.release();
+    try testing.expectEqual(@as(usize, 4), try collectDsts(s, 7));
+    try testing.expectEqual(@as(u64, 200), db.lastSeq());
+    // New files must not reuse numbers of files that exist.
+    try db.putEdge(7, 9999, 1);
+    try db.flush();
+    try testing.expectEqual(layout[0] + 1, db.levelFileCounts()[0]);
+}
+
+test "last_seq survives when every log is gone and compaction dropped the newest records" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    {
+        const db = try Db.open(testing.allocator, manualOpts(tmp.path));
+        defer db.close();
+        try db.putEdge(1, 2, 1); // seq 1
+        try db.flush();
+        try db.delEdge(1, 2); // seq 2
+        try db.flush();
+        // Nothing lies below L1, so this merge is the bottom: the tombstone and
+        // the put cancel out, and no segment records seq 2 any more.
+        try testing.expect(try db.compactLevel(0));
+        try testing.expectEqual(@as(usize, 0), db.segmentCount());
+    }
+    const db = try Db.open(testing.allocator, manualOpts(tmp.path));
+    defer db.close();
+    try testing.expectEqual(@as(u64, 2), db.lastSeq()); // from the manifest, not a segment
+    try db.putEdge(1, 3, 1);
+    try testing.expectEqual(@as(u64, 3), db.lastSeq()); // no sequence number reused
+}
+
+test "a tombstone is kept above the bottom level so a deleted edge stays deleted" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    const db = try Db.open(testing.allocator, manualOpts(tmp.path));
+    defer db.close();
+
+    try db.putEdge(1, 2, 1);
+    try db.flush();
+    try testing.expect(try db.compactLevel(0)); // put now at L1
+    try testing.expect(try db.compactLevel(1)); // ... and at L2, the deepest level so far
+    try db.delEdge(1, 2);
+    try db.flush();
+    try testing.expect(try db.compactLevel(0)); // tombstone to L1; the put still sits below it
+    {
+        const s = try db.snapshot();
+        defer s.release();
+        try testing.expectEqual(@as(usize, 0), try collectDsts(s, 1));
+    }
+    // L1 holds only the tombstone; had it been dropped, the put in L2 would be back.
+    const counts = db.levelFileCounts();
+    try testing.expectEqual(@as(usize, 1), counts[1]);
+    try testing.expectEqual(@as(usize, 1), counts[2]);
+    // Merging into L2 meets the put; now both can go.
+    try testing.expect(try db.compactLevel(1));
+    try testing.expectEqual(@as(usize, 0), db.segmentCount());
+    const s = try db.snapshot();
+    defer s.release();
+    try testing.expectEqual(@as(usize, 0), try collectDsts(s, 1));
+}
+
+test "an old snapshot keeps its versions through compaction; releasing it lets them go" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    const db = try Db.open(testing.allocator, manualOpts(tmp.path));
+    defer db.close();
+
+    try db.putEdge(1, 2, 1);
+    try db.putEdge(1, 3, 1);
+    try db.flush();
+    const old = try db.snapshot(); // sees 1->2 and 1->3
+    try db.delEdge(1, 2);
+    try db.putEdge(1, 3, 5); // overwrite
+    try db.flush();
+    try testing.expect(try db.compactLevel(0));
+    try testing.expect(try db.compactLevel(1));
+    try testing.expect(try db.compactLevel(2));
+
+    // The old snapshot still sees what it saw, from the pinned Version.
+    var got: std.ArrayList(sp.Edge) = .empty;
+    defer got.deinit(testing.allocator);
+    try collect(old, 1, &got);
+    try testing.expectEqual(@as(usize, 2), got.items.len);
+    try testing.expectEqual(@as(f32, 1), got.items[1].weight);
+
+    // New snapshots see the current graph, though the old version of 1->3 must
+    // survive in the files for `old`'s sake only if a snapshot could need it.
+    const fresh = try db.snapshot();
+    defer fresh.release();
+    try collect(fresh, 1, &got);
+    try testing.expectEqual(@as(usize, 1), got.items.len);
+    try testing.expectEqual(@as(f32, 5), got.items[0].weight);
+
+    // The pre-compaction files are pinned by `old`, so they are still on disk.
+    try testing.expect(try countFiles(tmp.path, ".seg") > db.segmentCount());
+    old.release();
+    try testing.expectEqual(db.segmentCount(), try countFiles(tmp.path, ".seg"));
+    try collect(fresh, 1, &got);
+    try testing.expectEqual(@as(usize, 1), got.items.len);
+}
+
+test "output segments split at vertex boundaries and a hub gets a segment of its own" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    var opts = manualOpts(tmp.path);
+    opts.target_segment_bytes = 24 * 50; // ~50 records per output
+    const db = try Db.open(testing.allocator, opts);
+    defer db.close();
+
+    for (0..40) |v| for (0..5) |d| try db.putEdge(v * 10, d, 1); // 40 vertices, 5 edges each
+    for (0..300) |d| try db.putEdge(1000, d, 1); // one hub, 300 edges, over the target
+    for (0..20) |v| try db.putEdge(2000 + v, 1, 1);
+    try db.flush();
+    try testing.expect(try db.compactLevel(0));
+    const counts = db.levelFileCounts();
+    try testing.expectEqual(@as(usize, 0), counts[0]);
+    try testing.expect(counts[1] >= 5); // split into many segments
+
+    // Every vertex is still readable, which exercises the per-level binary search
+    // over disjoint segments (and fails if two segments shared a vertex).
+    const s = try db.snapshot();
+    defer s.release();
+    for (0..40) |v| try testing.expectEqual(@as(usize, 5), try collectDsts(s, v * 10));
+    try testing.expectEqual(@as(usize, 300), try collectDsts(s, 1000));
+    for (0..20) |v| try testing.expectEqual(@as(usize, 1), try collectDsts(s, 2000 + v));
+    try testing.expectEqual(@as(usize, 0), try collectDsts(s, 5)); // a gap between segments
+}
+
+test "recovery drops orphan segments left by a flush or compaction that never reached the manifest" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    {
+        const db = try Db.open(testing.allocator, manualOpts(tmp.path));
+        defer db.close();
+        try db.putEdge(1, 2, 1);
+        try db.flush();
+    }
+    // A valid segment file that no manifest lists: copy the real one under a new number.
+    const real = try onlyFile(tmp.path, ".seg");
+    defer testing.allocator.free(real);
+    const orphan = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/000900.seg", .{tmp.path}, 0);
+    defer testing.allocator.free(orphan);
+    {
+        const f = try sys.File.open(real, .read);
+        defer f.close();
+        const bytes = try f.readAll(testing.allocator);
+        defer testing.allocator.free(bytes);
+        try overwriteFile(orphan, bytes);
+    }
+    try testing.expectEqual(@as(usize, 2), try countFiles(tmp.path, ".seg"));
+    const db = try Db.open(testing.allocator, manualOpts(tmp.path));
+    defer db.close();
+    try testing.expectEqual(@as(usize, 1), try countFiles(tmp.path, ".seg"));
+    try testing.expectEqual(@as(usize, 1), db.segmentCount());
+    try db.putEdge(5, 6, 1);
+    try db.flush(); // file numbers continue past the orphan's
+    try testing.expectEqual(@as(usize, 2), try countFiles(tmp.path, ".seg"));
+}
+
+test "a manifest edit that was torn mid-append is ignored; damage elsewhere is refused" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    {
+        const db = try Db.open(testing.allocator, manualOpts(tmp.path));
+        defer db.close();
+        try db.putEdge(1, 2, 1);
+        try db.flush();
+        try db.putEdge(1, 3, 1);
+        try db.flush();
+    }
+    // Find the live manifest through CURRENT.
+    const cur = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/CURRENT", .{tmp.path}, 0);
+    defer testing.allocator.free(cur);
+    const cf = try sys.File.open(cur, .read);
+    const name = try cf.readAll(testing.allocator);
+    cf.close();
+    defer testing.allocator.free(name);
+    const manifest = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/{s}", .{ tmp.path, std.mem.trimEnd(u8, name, "\n") }, 0);
+    defer testing.allocator.free(manifest);
+    const mf = try sys.File.open(manifest, .read);
+    const good = try mf.readAll(testing.allocator);
+    mf.close();
+    defer testing.allocator.free(good);
+
+    // Append half of a record: the crash hit while the edit was being written.
+    {
+        const torn = try testing.allocator.alloc(u8, good.len + 11);
+        defer testing.allocator.free(torn);
+        @memcpy(torn[0..good.len], good);
+        std.mem.writeInt(u32, torn[good.len..][0..4], 0xdeadbeef, .little);
+        std.mem.writeInt(u32, torn[good.len + 4 ..][0..4], 400, .little); // claims more than is there
+        @memset(torn[good.len + 8 ..], 7);
+        try overwriteFile(manifest, torn);
+        const db = try Db.open(testing.allocator, manualOpts(tmp.path));
+        defer db.close();
+        try testing.expectEqual(@as(usize, 2), db.segmentCount());
+        try testing.expectEqual(@as(u64, 2), db.lastSeq());
+    }
+    // Opening wrote a new manifest; damage the first record of that one: the
+    // records after it were acknowledged, so this is corruption, not a torn tail.
+    {
+        const cf2 = try sys.File.open(cur, .read);
+        const name2 = try cf2.readAll(testing.allocator);
+        cf2.close();
+        defer testing.allocator.free(name2);
+        const m2 = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/{s}", .{ tmp.path, std.mem.trimEnd(u8, name2, "\n") }, 0);
+        defer testing.allocator.free(m2);
+        const f = try sys.File.open(m2, .read);
+        const bytes = try f.readAll(testing.allocator);
+        f.close();
+        defer testing.allocator.free(bytes);
+        // Append a valid-looking second record so the first has a successor.
+        const ext = try testing.allocator.alloc(u8, bytes.len + 8);
+        defer testing.allocator.free(ext);
+        @memcpy(ext[0..bytes.len], bytes);
+        @memset(ext[bytes.len..], 0); // len 0, crc 0 == crc32c("")
+        ext[8 + 8 + 2] ^= 0x40; // flip a payload byte of the first record
+        try overwriteFile(m2, ext);
+        try testing.expectError(error.Corrupt, Db.open(testing.allocator, manualOpts(tmp.path)));
+    }
+}
+
+test "open refuses a layout whose segment file has gone missing, or CURRENT naming nothing" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    {
+        const db = try Db.open(testing.allocator, manualOpts(tmp.path));
+        defer db.close();
+        try db.putEdge(1, 2, 1);
+        try db.flush();
+    }
+    const seg = try onlyFile(tmp.path, ".seg");
+    defer testing.allocator.free(seg);
+    const saved = blk: {
+        const f = try sys.File.open(seg, .read);
+        defer f.close();
+        break :blk try f.readAll(testing.allocator);
+    };
+    defer testing.allocator.free(saved);
+    sys.unlink(seg);
+    try testing.expectError(error.Corrupt, Db.open(testing.allocator, manualOpts(tmp.path)));
+    try overwriteFile(seg, saved);
+
+    const cur = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/CURRENT", .{tmp.path}, 0);
+    defer testing.allocator.free(cur);
+    try overwriteFile(cur, "MANIFEST-424242\n");
+    try testing.expectError(error.Corrupt, Db.open(testing.allocator, manualOpts(tmp.path)));
+    try overwriteFile(cur, "garbage");
+    try testing.expectError(error.Corrupt, Db.open(testing.allocator, manualOpts(tmp.path)));
+}
+
+test "invalid compaction options are rejected" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    var o = manualOpts(tmp.path);
+    o.l0_stop_trigger = o.l0_compaction_trigger; // a stalled writer could never be released
+    try testing.expectError(error.InvalidArgument, Db.open(testing.allocator, o));
+    o = manualOpts(tmp.path);
+    o.size_ratio = 1;
+    try testing.expectError(error.InvalidArgument, Db.open(testing.allocator, o));
+}
+
+// ---- phase 4: background compaction and stalls ---------------------------------
+
+test "background compaction keeps L0 bounded and writers stall when it falls behind" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    const db = try Db.open(testing.allocator, .{
+        .path = tmp.path,
+        .undirected = false,
+        .sync_mode = .none,
+        .memgraph_limit_bytes = 24 * 200,
+        .l0_compaction_trigger = 2,
+        .l0_stop_trigger = 3, // tight, so the writer outruns the compactor
+        .size_ratio = 4,
+        .level1_bytes = 24 * 2000,
+        .target_segment_bytes = 24 * 400,
+    });
+    defer db.close();
+    for (0..20_000) |i| {
+        try db.putEdge(i % 97, i, 1);
+        // Never more than stop_trigger files at once.
+        if (i % 500 == 0) try testing.expect(db.levelFileCounts()[0] <= 3);
+    }
+    try db.waitForCompaction();
+    const st = db.stats();
+    try testing.expect(st.flushes > 50);
+    try testing.expect(st.stalls > 0 and st.stall_ns > 0);
+    try testing.expect(db.levelFileCounts()[0] < 2);
+    var deep: usize = 0;
+    for (db.levelFileCounts()[2..]) |n| deep += n;
+    try testing.expect(deep > 0); // data descended past L1
+
+    const s = try db.snapshot();
+    defer s.release();
+    for (0..97) |v| {
+        var want: usize = 0;
+        var i = v;
+        while (i < 20_000) : (i += 97) want += 1;
+        try testing.expectEqual(want, try collectDsts(s, v));
+    }
+}
+
+test "reads stay consistent while the writer flushes and compaction replaces segments" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    const db = try Db.open(testing.allocator, .{
+        .path = tmp.path,
+        .undirected = false,
+        .sync_mode = .none,
+        .memgraph_limit_bytes = 24 * 100,
+        .l0_compaction_trigger = 2,
+        .l0_stop_trigger = 6,
+        .size_ratio = 3,
+        .level1_bytes = 24 * 800,
+        .target_segment_bytes = 24 * 150,
+    });
+    defer db.close();
+
+    const Reader = struct {
+        fn run(d: *Db, stop: *std.atomic.Value(bool), bad: *std.atomic.Value(u32)) void {
+            while (!stop.load(.acquire)) {
+                const s = d.snapshot() catch return;
+                defer s.release();
+                // The writer puts 1->1000, 1->1001, ... in order, so every
+                // snapshot must see a gapless prefix, wherever the data lives.
+                var it = s.neighbors(testing.allocator, 1) catch return;
+                defer it.deinit();
+                var expect: u64 = 1000;
+                while (it.next()) |e| {
+                    if (e.dst != expect) bad.store(1, .release);
+                    expect += 1;
+                }
+                if (expect - 1000 != s.seq) bad.store(1, .release);
+            }
+        }
+    };
+    var stop: std.atomic.Value(bool) = .init(false);
+    var bad: std.atomic.Value(u32) = .init(0);
+    var threads: [3]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Reader.run, .{ db, &stop, &bad });
+    for (0..4000) |i| try db.putEdge(1, 1000 + i, 1);
+    try db.waitForCompaction();
+    stop.store(true, .release);
+    for (threads) |t| t.join();
+    try testing.expectEqual(@as(u32, 0), bad.load(.acquire));
+    try testing.expect(db.stats().flushes > 20);
+    var compactions: u64 = 0;
+    for (db.stats().levels) |l| compactions += l.compactions;
+    try testing.expect(compactions > 5);
+}
+
+test "an upgraded database from before manifests opens as an all-L0 layout" {
+    var tmp = try TmpDir.init();
+    defer tmp.deinit();
+    {
+        const db = try Db.open(testing.allocator, manualOpts(tmp.path));
+        defer db.close();
+        try db.putEdge(1, 2, 1);
+        try db.flush();
+        try db.putEdge(1, 3, 1);
+        try db.flush();
+    }
+    // Phase 2 directories had no CURRENT and no MANIFEST.
+    const cur = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/CURRENT", .{tmp.path}, 0);
+    defer testing.allocator.free(cur);
+    sys.unlink(cur);
+    const mani = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/MANIFEST-000002", .{tmp.path}, 0);
+    defer testing.allocator.free(mani);
+    sys.unlink(mani);
+    const db = try Db.open(testing.allocator, manualOpts(tmp.path));
+    defer db.close();
+    try testing.expectEqual(@as(usize, 2), db.levelFileCounts()[0]);
+    try testing.expectEqual(@as(u64, 2), db.lastSeq());
+    const s = try db.snapshot();
+    defer s.release();
+    try testing.expectEqual(@as(usize, 2), try collectDsts(s, 1));
 }
